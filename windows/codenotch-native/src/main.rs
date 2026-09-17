@@ -108,20 +108,22 @@ fn trace(line: &str) {
     }
 }
 
-// Arriving and leaving are not mirror images. Coming in is springy and allowed one small overshoot;
-// going away is critically damped, because an overshoot on the way out looks like the window could
-// not make up its mind. Leaving is also quicker — waiting for something to finish disappearing is
-// the part nobody enjoys.
-const REVEAL_RESPONSE: f32 = 0.34; // seconds for one oscillation
-const REVEAL_DAMPING: f32 = 0.72; // below 1.0, so it passes the target once
-// Leaving is the longer of the two now. Critical damping spends most of the distance in the first
-// few frames and then creeps, which reads as being snatched away even when the total time is not
-// short; easing off the damping trades that for a visible deceleration.
-const DISMISS_RESPONSE: f32 = 0.62;
-const DISMISS_DAMPING: f32 = 0.92;
-/// The panel's own box closes slower still. It is the thing being read, so it should be the last
-/// thing to go.
-const PANEL_CLOSE_RESPONSE: f32 = 0.70;
+// Spring timings, in the terms SwiftUI uses so the numbers can be compared with Apple's own.
+// `duration` is the perceptual duration -- their docs call it "approximately equal to the settling
+// duration" -- and `bounce` runs from 0 (critically damped, no overshoot) to 1 (undamped). Apple's
+// default is duration 0.5, bounce 0; measured at 60 fps that is about 380 ms of visible movement.
+//
+// Arriving and leaving are not mirror images. Coming in is quick and allowed one small overshoot,
+// because a panel that answers the pointer slowly feels unresponsive. Going away takes its time:
+// nothing is waiting on it, and a dismissal that hurries reads as the thing being snatched away
+// rather than leaving.
+const REVEAL_DURATION: f32 = 0.34;
+const REVEAL_BOUNCE: f32 = 0.28; // passes the target once and settles
+const DISMISS_DURATION: f32 = 0.95; // about 665 ms visible, comfortably past Apple's default
+const DISMISS_BOUNCE: f32 = 0.04; // all but critically damped: no wobble on the way out
+/// The panel's own box closes slower still, and without any bounce. It is the thing being read, so
+/// it is the last to go and the calmest about it.
+const PANEL_CLOSE_DURATION: f32 = 1.1;
 /// While a panel is still on screen the pill stays out, however the pointer left. The panel is
 /// drawn inside the window, so retracting first does not animate it away — it drags it off the
 /// edge, and what the eye sees is the panel being cut rather than closing.
@@ -358,24 +360,27 @@ fn pretty(provider: &str) -> &'static str {
 /// dead before turning round. A spring carries its velocity through a target change, so a reversal
 /// keeps the momentum it already had.
 ///
-/// Parameterised the way SwiftUI does it: `response` is the period of one oscillation in seconds,
-/// `damping` is the fraction of critical damping (1.0 settles with no overshoot).
+/// Parameterised exactly as SwiftUI's `spring(duration:bounce:)`, so the constants above mean what
+/// Apple's mean and can be read against their presets. `duration` is the perceptual duration, which
+/// their documentation describes as approximately the settling duration; `bounce` is 0 for a
+/// critically damped spring up to 1 for an undamped one, and the damping fraction is `1 - bounce`.
 struct Spring {
     value: f32,
     vel: f32,
-    response: f32,
-    damping: f32,
+    duration: f32,
+    bounce: f32,
 }
 
 impl Spring {
-    fn new(value: f32, response: f32, damping: f32) -> Spring {
-        Spring { value, vel: 0.0, response, damping }
+    fn new(value: f32, duration: f32, bounce: f32) -> Spring {
+        Spring { value, vel: 0.0, duration, bounce }
     }
 
     fn step(&mut self, target: f32, dt: f32) {
         use std::f32::consts::PI;
-        let k = (2.0 * PI / self.response).powi(2); // stiffness, unit mass
-        let c = 4.0 * PI * self.damping / self.response;
+        let zeta = 1.0 - self.bounce;
+        let k = (2.0 * PI / self.duration).powi(2); // stiffness, unit mass
+        let c = 4.0 * PI * zeta / self.duration;
         // Substepped: one 16 ms leap with a stiff spring can integrate its way out of the screen.
         const SUB: usize = 8;
         let h = (dt / SUB as f32).min(0.004);
@@ -485,6 +490,21 @@ fn next_panel(current: Option<usize>, hit: Option<usize>) -> Option<usize> {
 /// swap the two differ, and the panel shuts on its way to the other one.
 fn card_target(shown: Option<usize>, want: Option<usize>) -> f32 {
     if shown.is_some() && shown == want { 1.0 } else { 0.0 }
+}
+
+/// How far along a staggered item is, given the panel's own progress. Rows arrive one after the
+/// other rather than all at once — the "per object" sequencing in Apple's own motion work — and
+/// each one eases out on its own. `i` is the row's place in the order, `n` how many there are.
+fn stagger(progress: f32, i: usize, n: usize) -> f32 {
+    if n <= 1 {
+        return progress.clamp(0.0, 1.0);
+    }
+    // The last row still finishes with the panel: the lead shrinks as the list grows, so a long
+    // list does not trail off past the animation it belongs to.
+    const LEAD: f32 = 0.45;
+    let step = LEAD / (n - 1) as f32;
+    let start = i as f32 * step;
+    ease_out(((progress - start) / (1.0 - LEAD)).clamp(0.0, 1.0))
 }
 
 /// Where the pill spring is headed. Out while the pointer is on it, and for as long as a panel is
@@ -666,21 +686,28 @@ fn draw_panels(c: &mut Canvas, f: &Frame, font: &mut Text) {
             y += ROW_PX * s;
             font.left_aligned(c, "no reading", text_left, y, ROW_PX * s, MUTED, a);
         }
+        // Rows arrive in order rather than together, each easing out on its own, and each slides
+        // the last few pixels up into place as it fades.
+        let total_rows = r.rows.len() + r.sessions.len();
         for (n, (label, used)) in r.rows.iter().enumerate() {
             if n > 0 {
                 y += ROW_GAP * s;
             }
             y += ROW_PX * s;
+            // `ry` is where this row draws, `y` stays the layout cursor the loop advances.
+            let t = stagger(f.card, n, total_rows);
+            let a = a * t;
+            let ry = y + (1.0 - t) * 6.0 * s;
             // The percentage still sits at the end of the label line: the bar carries the shape,
             // the number is there when the exact value matters.
             let value = pct_label(*used);
             let vw = font.width(&value, ROW_PX * s);
             let room = (inner_w - vw - 10.0 * s).max(10.0);
             let label = font.elide(label, ROW_PX * s, room);
-            font.left_aligned(c, &label, text_left, y, ROW_PX * s, MUTED, a);
-            font.left_aligned(c, &value, text_right - vw, y, ROW_PX * s, MUTED, a);
+            font.left_aligned(c, &label, text_left, ry, ROW_PX * s, MUTED, a);
+            font.left_aligned(c, &value, text_right - vw, ry, ROW_PX * s, MUTED, a);
             y += BAR_GAP * s;
-            draw_bar(c, text_left, y, inner_w, BAR_H * s, *used, a);
+            draw_bar(c, text_left, ry + BAR_GAP * s, inner_w, BAR_H * s, *used, a);
             y += BAR_H * s;
         }
 
@@ -692,13 +719,16 @@ fn draw_panels(c: &mut Canvas, f: &Frame, font: &mut Text) {
                     y += ROW_GAP * 0.5 * s;
                 }
                 y += ROW_PX * s;
+                let t = stagger(f.card, r.rows.len() + n, total_rows);
+                let a = a * t;
+                let ry = y + (1.0 - t) * 6.0 * s;
                 let head = font.elide(title, ROW_PX * s, inner_w * 0.45);
-                let pen = font.left_aligned(c, &head, text_left, y, ROW_PX * s, INK, a * 0.9);
+                let pen = font.left_aligned(c, &head, text_left, ry, ROW_PX * s, INK, a * 0.9);
                 let room = text_right - pen - 8.0 * s;
                 if room > 12.0 * s {
                     let detail = font.elide(what, ROW_PX * s, room);
                     let dw = font.width(&detail, ROW_PX * s);
-                    font.left_aligned(c, &detail, text_right - dw, y, ROW_PX * s, MUTED, a);
+                    font.left_aligned(c, &detail, text_right - dw, ry, ROW_PX * s, MUTED, a);
                 }
             }
         }
@@ -855,8 +885,8 @@ fn main() {
 
         // One spring drives the reveal, a second the card, so the two can be at different points
         // without fighting each other.
-        let mut open = Spring::new(0.0, REVEAL_RESPONSE, REVEAL_DAMPING);
-        let mut card = Spring::new(0.0, REVEAL_RESPONSE, DISMISS_DAMPING);
+        let mut open = Spring::new(0.0, REVEAL_DURATION, REVEAL_BOUNCE);
+        let mut card = Spring::new(0.0, REVEAL_DURATION, 0.0);
         let mut shown = false;
         // Which ring's panel is out, if any.
         // What the pointer asked for, and what is actually drawn. They differ only while one panel
@@ -1003,11 +1033,10 @@ fn main() {
                     if want { "enter" } else { "leave" },
                     cur.x, cur.y
                 ));
+                // The spring's value and velocity carry straight over; its constants are set from
+                // the target further down, once per frame. A reversal therefore keeps the momentum
+                // it already had.
                 shown = want;
-                // Only the constants change; the spring's value and velocity carry straight over,
-                // so a reversal keeps the momentum it already had.
-                open.response = if shown { REVEAL_RESPONSE } else { DISMISS_RESPONSE };
-                open.damping = if shown { REVEAL_DAMPING } else { DISMISS_DAMPING };
             }
             // Leaving closes the panel too: it must not be left hanging open off the edge.
             if !shown && panel_want.is_some() {
@@ -1028,7 +1057,7 @@ fn main() {
             // The panel closes before it swaps: the box shrinks away, the contents change at the
             // bottom of that dip, and it opens again. Changing them mid-flight would be a cut.
             let card_to = card_target(panel_shown, panel_want);
-            card.response = if card_to > 0.5 { REVEAL_RESPONSE } else { PANEL_CLOSE_RESPONSE };
+            card.duration = if card_to > 0.5 { REVEAL_DURATION } else { PANEL_CLOSE_DURATION };
             if !card.settled(card_to) {
                 card.step(card_to, dt);
             }
@@ -1040,8 +1069,8 @@ fn main() {
             // The pill waits for the panel to finish leaving before it retracts, or the panel goes
             // out of the frame instead of out of the way.
             let open_target = pill_target(shown, card.value);
-            open.response = if open_target > 0.5 { REVEAL_RESPONSE } else { DISMISS_RESPONSE };
-            open.damping = if open_target > 0.5 { REVEAL_DAMPING } else { DISMISS_DAMPING };
+            open.duration = if open_target > 0.5 { REVEAL_DURATION } else { DISMISS_DURATION };
+            open.bounce = if open_target > 0.5 { REVEAL_BOUNCE } else { DISMISS_BOUNCE };
             if !open.settled(open_target) {
                 open.step(open_target, dt);
             }
@@ -1308,6 +1337,31 @@ mod tests {
     }
 
     #[test]
+    fn rows_arrive_one_after_another() {
+        // Per-object sequencing: at the same moment the first row is further along than the last.
+        let early = stagger(0.5, 0, 4);
+        let late = stagger(0.5, 3, 4);
+        assert!(early > late, "the first row should lead: {early:.2} against {late:.2}");
+    }
+
+    #[test]
+    fn every_row_starts_hidden_and_ends_shown() {
+        for n in [1usize, 2, 5] {
+            for i in 0..n {
+                assert_eq!(stagger(0.0, i, n), 0.0, "row {i} of {n} should start invisible");
+                assert!((stagger(1.0, i, n) - 1.0).abs() < 1e-3, "row {i} of {n} should finish");
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_list_still_finishes_with_the_panel() {
+        // The lead shrinks as the list grows, or the last row of a long one would still be sliding
+        // in after the box around it had settled.
+        assert!((stagger(1.0, 19, 20) - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn a_swap_closes_before_it_opens() {
         // Drawn panel and wanted panel differ only mid-swap, and the box is shut for that stretch.
         assert_eq!(card_target(Some(0), Some(0)), 1.0, "settled open");
@@ -1320,14 +1374,18 @@ mod tests {
     fn leaving_is_unhurried() {
         // Twice it came back as still too fast. Leaving is now the longer of the two, and the
         // panel's own box is longer again — it is the thing being read, so it goes last.
-        assert!(DISMISS_RESPONSE > REVEAL_RESPONSE, "leaving should outlast arriving");
-        assert!(PANEL_CLOSE_RESPONSE >= DISMISS_RESPONSE, "the panel should be the last to go");
+        // Apple's stock spring is duration 0.5, bounce 0. This is deliberately past it.
+        const APPLE_DEFAULT_DURATION: f32 = 0.5;
+        assert!(DISMISS_DURATION > REVEAL_DURATION, "leaving should outlast arriving");
+        assert!(DISMISS_DURATION > APPLE_DEFAULT_DURATION, "and outlast a stock spring too");
+        assert!(PANEL_CLOSE_DURATION >= DISMISS_DURATION, "the panel should be the last to go");
+        assert!(DISMISS_BOUNCE < 0.1, "a dismissal should not wobble");
     }
 
     /// Frames until the spring has covered all but the last 5 %, at 60 fps. The rest is sub-pixel
     /// creep that nobody sees, so this — not the time to settle — is how long the move looks.
-    fn visible_frames(response: f32, damping: f32) -> usize {
-        run(1.0, 0.0, response, damping).iter().take_while(|v| **v > 0.05).count()
+    fn visible_frames(duration: f32, bounce: f32) -> usize {
+        run(1.0, 0.0, duration, bounce).iter().take_while(|v| **v > 0.05).count()
     }
 
     #[test]
@@ -1337,15 +1395,15 @@ mod tests {
         // the largest displacement — so "distance in the first quarter of the frames" says nothing
         // about how rushed it looks, and no damping value changes it. What matters is how long the
         // part you can actually see lasts.
-        let frames = visible_frames(DISMISS_RESPONSE, DISMISS_DAMPING);
+        let frames = visible_frames(DISMISS_DURATION, DISMISS_BOUNCE);
         let seconds = frames as f32 / 60.0;
-        assert!(seconds > 0.35, "the exit is over in {seconds:.2}s, which reads as a snap");
-        assert!(seconds < 0.9, "and this long starts to feel like waiting: {seconds:.2}s");
+        assert!(seconds > 0.55, "the exit is over in {seconds:.2}s, which reads as a snap");
+        assert!(seconds < 1.1, "and this long starts to feel like waiting: {seconds:.2}s");
     }
 
     #[test]
     fn the_panel_outlasts_the_pill_on_the_way_out() {
-        assert!(visible_frames(PANEL_CLOSE_RESPONSE, DISMISS_DAMPING) >= visible_frames(DISMISS_RESPONSE, DISMISS_DAMPING));
+        assert!(visible_frames(PANEL_CLOSE_DURATION, 0.0) >= visible_frames(DISMISS_DURATION, DISMISS_BOUNCE));
     }
 
     #[test]
@@ -1412,8 +1470,8 @@ mod tests {
     // ------------------------------------------------------------ animation
 
     /// Runs the spring at a fixed 60 fps until it settles, returning every value it passed through.
-    fn run(from: f32, target: f32, response: f32, damping: f32) -> Vec<f32> {
-        let mut sp = Spring::new(from, response, damping);
+    fn run(from: f32, target: f32, duration: f32, bounce: f32) -> Vec<f32> {
+        let mut sp = Spring::new(from, duration, bounce);
         let mut seen = vec![sp.value];
         for _ in 0..600 {
             if sp.settled(target) {
@@ -1427,7 +1485,7 @@ mod tests {
 
     #[test]
     fn the_reveal_spring_overshoots_once_and_settles() {
-        let seen = run(0.0, 1.0, REVEAL_RESPONSE, REVEAL_DAMPING);
+        let seen = run(0.0, 1.0, REVEAL_DURATION, REVEAL_BOUNCE);
         let peak = seen.iter().copied().fold(f32::MIN, f32::max);
         assert!(peak > 1.0, "the reveal should pass its target, peaked at {peak}");
         assert!(peak < 1.15, "the overshoot should be a nudge, not a bounce: {peak}");
@@ -1436,15 +1494,22 @@ mod tests {
 
     #[test]
     fn the_dismiss_spring_never_overshoots() {
-        let seen = run(1.0, 0.0, DISMISS_RESPONSE, DISMISS_DAMPING);
+        let seen = run(1.0, 0.0, DISMISS_DURATION, DISMISS_BOUNCE);
         let under = seen.iter().copied().fold(f32::MAX, f32::min);
         assert!(under >= -0.005, "dismiss dipped past its target to {under}");
     }
 
     #[test]
-    fn both_springs_settle_in_well_under_a_second() {
-        assert!(run(0.0, 1.0, REVEAL_RESPONSE, REVEAL_DAMPING).len() < 60);
-        assert!(run(1.0, 0.0, DISMISS_RESPONSE, DISMISS_DAMPING).len() < 60);
+    fn the_entrance_is_prompt_and_the_exit_is_not() {
+        // The entrance answers the pointer, so it has to be quick. The exit has nobody waiting on
+        // it and was reported as rushed three times, so it is deliberately the long one — this
+        // assertion used to demand both settle inside a second and had to be rewritten rather than
+        // satisfied.
+        let arrive = run(0.0, 1.0, REVEAL_DURATION, REVEAL_BOUNCE).len();
+        let leave = run(1.0, 0.0, DISMISS_DURATION, DISMISS_BOUNCE).len();
+        assert!(arrive < 60, "the entrance should settle briskly, took {arrive} frames");
+        assert!(leave > arrive, "the exit should take longer than the entrance");
+        assert!(leave < 180, "but not turn into a wait: {leave} frames");
     }
 
     #[test]
@@ -1453,15 +1518,15 @@ mod tests {
         // velocity. Measured against an identical spring released from rest at the same place —
         // not against the sign of `vel`, because the dismiss spring is stiff enough to flip that
         // inside a single 16 ms frame, which is correct and says nothing about continuity.
-        let mut moving = Spring::new(0.0, REVEAL_RESPONSE, REVEAL_DAMPING);
+        let mut moving = Spring::new(0.0, REVEAL_DURATION, REVEAL_BOUNCE);
         for _ in 0..6 {
             moving.step(1.0, 1.0 / 60.0);
         }
         assert!(moving.vel > 0.0, "should be travelling outward by now");
 
-        let mut from_rest = Spring::new(moving.value, DISMISS_RESPONSE, DISMISS_DAMPING);
-        moving.response = DISMISS_RESPONSE;
-        moving.damping = DISMISS_DAMPING;
+        let mut from_rest = Spring::new(moving.value, DISMISS_DURATION, DISMISS_BOUNCE);
+        moving.duration = DISMISS_DURATION;
+        moving.bounce = DISMISS_BOUNCE;
 
         moving.step(0.0, 1.0 / 60.0);
         from_rest.step(0.0, 1.0 / 60.0);
@@ -1470,7 +1535,7 @@ mod tests {
 
     #[test]
     fn a_stalled_frame_cannot_launch_the_spring() {
-        let mut sp = Spring::new(0.0, REVEAL_RESPONSE, REVEAL_DAMPING);
+        let mut sp = Spring::new(0.0, REVEAL_DURATION, REVEAL_BOUNCE);
         sp.step(1.0, 0.05);
         assert!(sp.value.is_finite() && sp.value.abs() < 3.0, "diverged to {}", sp.value);
     }
@@ -1553,7 +1618,7 @@ mod tests {
         // off-screen, comes into view with desktop behind it.
         let (hidden_x, shown_x) = (3433.0, 2953.0);
         let place = |v: f32| (hidden_x + (shown_x - hidden_x) * v).max(shown_x).min(hidden_x);
-        let peak = run(0.0, 1.0, REVEAL_RESPONSE, REVEAL_DAMPING)
+        let peak = run(0.0, 1.0, REVEAL_DURATION, REVEAL_BOUNCE)
             .iter()
             .copied()
             .fold(f32::MIN, f32::max);
