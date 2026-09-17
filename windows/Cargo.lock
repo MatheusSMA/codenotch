@@ -556,6 +556,8 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "tiny_http",
+ "ureq",
  "windows 0.58.0",
 ]
 

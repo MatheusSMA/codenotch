@@ -6,10 +6,11 @@
 //! session transcripts under `~/.claude/projects/**/*.jsonl`. A file that grew a moment ago means
 //! something is being written, which means a turn is in progress.
 //!
-//! What this deliberately cannot tell you is `attention` — "the chat is waiting on you". That
-//! distinction arrives as a hook event and has no signature on disk; a transcript that stopped
-//! growing looks identical whether the turn finished or is waiting for an answer. Showing amber
-//! here would be a guess, so this reports only working or idle.
+//! What this file cannot tell you is `attention` — "the chat is waiting on you". That distinction
+//! has no signature on disk: a transcript that stopped growing looks identical whether the turn
+//! finished or is waiting for an answer. It arrives as a hook event instead, through `hooks.rs`,
+//! and the caller prefers that answer whenever it has one. This file is the fallback for when it
+//! does not — a provider with no hooks wired up, or one that is not Claude.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -29,6 +30,9 @@ pub enum Work {
     Idle,
     /// A turn is in progress: the ring spins.
     Running,
+    /// The session is waiting on the user — a permission prompt or a question. Only a hook event
+    /// can say this; see the module note on why it cannot be inferred from the transcripts.
+    Attention,
 }
 
 /// Transcript roots per provider, mirroring `watcher.rs::roots`.

@@ -19,20 +19,34 @@ sem tocar no `dwm.exe`.
 - Porcentagem na Segoe UI Semibold
 - Auto-hide na borda, com mola de verdade (velocidade sobrevive a interrupcao)
 - Card de detalhes: clique na pill abre, clique de novo fecha, sair com o mouse fecha
-- Anel girando enquanto ha um turno em andamento
+- Anel girando enquanto ha um turno em andamento, e anel ambar pulsando quando
+  uma sessao espera resposta sua
+- Servidor de hooks na porta 48666: recebe os eventos do Claude Code direto,
+  entao o card lista as sessoes vivas e o que cada uma esta fazendo
 
 ## O que ainda nao faz
 
-- **Nao busca nada.** Le os snapshots que o app original persiste
-  (`usage.json`, `codex.json`). Sem ele rodando, os numeros congelam.
-- **Sem o estado `attention`** (o amarelo de "o chat espera por voce"). Ele chega
-  como hook event na porta 48666, que e do app original, e nao tem assinatura em
-  disco: um transcript que parou de crescer e identico quer o turno tenha acabado
-  ou esteja esperando resposta. Mostrar amarelo aqui seria chute.
+- **Nao busca os numeros de uso.** Le os snapshots que o app original persiste
+  (`usage.json`, `codex.json`). Sem ele rodando eles congelam, e a notch passa a
+  mostra-los esmaecidos, como o build web faz com um `stale`. Portar `usage.rs` e
+  `codex.rs` (~57 KB) e o que falta para ficar sozinho de vez.
 - Sem icone de bandeja e sem tela de configuracoes.
 
-O passo que resolve os tres e tomar a porta 48666, o que obriga a portar tambem
-`usage.rs` e `codex.rs`, e aposenta o app original.
+## Sobre a porta 48666
+
+Esta binario **toma** a porta dos hooks. E o que torna o `attention` possivel:
+so um hook event distingue um turno terminado de um esperando resposta, e isso
+nao tem assinatura em disco. Consequencia: o app original nao pode rodar junto.
+
+Se o bind falhar (o original ainda esta de pe), a notch continua funcionando e
+cai para inferir "trabalhando" dos transcripts — so nao consegue mostrar ambar.
+
+## Diagnostico
+
+`CODENOTCH_TRACE=1` faz o app registrar cada mudanca de estado em
+`%TEMP%\codenotch-native.log`. Vale a pena porque cutucar essa janela de fora
+engana: ela e per-monitor DPI aware e a maioria das ferramentas nao e, entao um
+cursor lido de outro processo nao concorda com o que ela ve.
 
 ## Rodar
 

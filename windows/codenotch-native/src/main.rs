@@ -13,14 +13,18 @@
 
 mod activity;
 mod glyphs;
+mod hooks;
 mod paint;
+mod state;
 mod text;
 
 use activity::Work;
 use glyphs::Marks;
+use hooks::Hub;
 use paint::{band, Canvas};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use text::Text;
 use windows::core::w;
@@ -63,6 +67,29 @@ const TICK: Duration = Duration::from_millis(16);
 const POLL: Duration = Duration::from_secs(2);
 /// One turn of the working arc, matching `spin 1.2s` in notch.html.
 const SPIN_PERIOD: f32 = 1.2;
+/// One breath of the attention ring, matching `pulse 1.1s`.
+const PULSE_PERIOD: f32 = 1.1;
+/// The hook port the Claude Code hooks already post to. Taking it means the original app cannot
+/// run at the same time — which is the point: whoever holds it owns the session state.
+const HOOK_PORT: u16 = 48666;
+
+/// With CODENOTCH_TRACE set, every change of state is appended to `%TEMP%\codenotch-native.log`.
+/// Poking at this window from outside is unreliable — it is per-monitor DPI aware while most tools
+/// are not, so a cursor read from another process does not agree with what this one sees. Asking
+/// the app what it thinks is the only account that means anything.
+fn trace(line: &str) {
+    if std::env::var_os("CODENOTCH_TRACE").is_none() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::temp_dir().join("codenotch-native.log"))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
 
 // Arriving and leaving are not mirror images. Coming in is springy and allowed one small overshoot;
 // going away is critically damped, because an overshoot on the way out looks like the window could
@@ -83,6 +110,8 @@ const CONTENT_MIN_SCALE: f32 = 0.93;
 /// Pure white. notch.html uses #e8e8ea, which next to a black pill reads as grey.
 const INK: [f32; 3] = [1.0, 1.0, 1.0];
 const MUTED: [f32; 3] = [0.62, 0.62, 0.65];
+/// Amber, for a session waiting on an answer — the same cue `.arc-pulse` carries in notch.html.
+const WATCH: [f32; 3] = [0.98, 0.80, 0.08];
 const PILL_BG: [f32; 3] = [0.0, 0.0, 0.0];
 const CARD_BG: [f32; 3] = [0.04, 0.04, 0.04];
 const PILL_EDGE: [f32; 3] = [0.18, 0.18, 0.18];
@@ -120,6 +149,8 @@ struct Reading {
     stale: bool,
     rows: Vec<(String, Option<f32>)>,
     work: Work,
+    /// Live sessions, when hook events are reaching us. Empty for providers with no hooks.
+    sessions: Vec<(String, String)>,
 }
 
 /// Five minutes, the window `staleOf` in notch.html uses before it stops trusting a reading.
@@ -129,7 +160,41 @@ fn data_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_default().join("codenotch")
 }
 
-fn read_provider(provider: &str) -> Reading {
+/// What the hook events say, when we are the ones receiving them. `None` means the session table
+/// is empty — nothing has reported in — and the caller should fall back to watching the files.
+fn work_from_hooks(hub: &Hub) -> Option<(Work, Vec<(String, String)>)> {
+    let store = hub.store.lock().ok()?;
+    let snap = store.snapshot("en", "en", true, false);
+    if snap.sessions.is_empty() {
+        return None;
+    }
+    let work = match snap.agg.as_str() {
+        state::ST_ATTENTION => Work::Attention,
+        state::ST_RUNNING => Work::Running,
+        _ => Work::Idle,
+    };
+    // The card lists what is actually going on, most urgent first — `snapshot` already sorted them.
+    let sessions = snap
+        .sessions
+        .iter()
+        .take(4)
+        .map(|s| {
+            let what = match s.state.as_str() {
+                state::ST_ATTENTION if !s.attn.is_empty() => s.attn.clone(),
+                state::ST_ATTENTION => "waiting on you".into(),
+                state::ST_RUNNING if !s.last.is_empty() => s.last.clone(),
+                state::ST_RUNNING => "working".into(),
+                state::ST_DONE => "done".into(),
+                _ => "idle".into(),
+            };
+            let title = if s.title.is_empty() { s.id.clone() } else { s.title.clone() };
+            (title, what)
+        })
+        .collect();
+    Some((work, sessions))
+}
+
+fn read_provider(provider: &str, hub: &Hub) -> Reading {
     let file = match provider {
         "codex" => "codex.json",
         "cursor" => "cursor.json",
@@ -141,9 +206,17 @@ fn read_provider(provider: &str) -> Reading {
         .and_then(|t| serde_json::from_str::<Snapshot>(&t).ok())
     {
         Some(snap) => reading_of(&snap, now_ms()),
-        None => Reading { used: None, stale: false, rows: Vec::new(), work: Work::Idle },
+        None => Reading { used: None, stale: false, rows: Vec::new(), work: Work::Idle, sessions: Vec::new() },
     };
-    r.work = activity::probe(provider);
+    // Hook events are the authority — they are the only thing that can say "waiting on you". The
+    // file scan is the fallback for a provider that never reports, or before the first event lands.
+    match (provider == "claude").then(|| work_from_hooks(hub)).flatten() {
+        Some((work, sessions)) => {
+            r.work = work;
+            r.sessions = sessions;
+        }
+        None => r.work = activity::probe(provider),
+    }
     r
 }
 
@@ -158,7 +231,7 @@ fn now_ms() -> i64 {
 fn reading_of(snap: &Snapshot, now: i64) -> Reading {
     // `needsAuth` and `none` mean there is no number to show; `stale` means show it dimmed.
     if snap.status == "needsAuth" || snap.status == "none" {
-        return Reading { used: None, stale: false, rows: Vec::new(), work: Work::Idle };
+        return Reading { used: None, stale: false, rows: Vec::new(), work: Work::Idle, sessions: Vec::new() };
     }
     // The headline is the first reading expressed as a fraction rather than a count. Claude calls
     // it `session`, Codex calls it `primary`, so the shape decides rather than the name.
@@ -180,6 +253,7 @@ fn reading_of(snap: &Snapshot, now: i64) -> Reading {
             })
             .collect(),
         work: Work::Idle,
+        sessions: Vec::new(),
     }
 }
 
@@ -400,11 +474,19 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
             }
         }
 
-        // The working arc: a short arc turning inside the ring while a turn is in progress. Same
-        // 28 % of a circle and 1.2 s period as `.arc-spin` in notch.html.
-        if r.work == Work::Running {
-            let turn = (f.t / SPIN_PERIOD).fract();
-            c.arc(cx, ring_cy, 19.0 * s * f.cs, 2.5 * s * f.cs, INK, 0.95, turn, turn + 0.28);
+        // The inner ring says what the session is doing: a short arc turning while a turn is in
+        // progress, a whole ring breathing amber while it waits on an answer. Same 28 % sweep,
+        // 1.2 s turn and 1.1 s breath as `.arc-spin` and `.arc-pulse` in notch.html.
+        match r.work {
+            Work::Running => {
+                let turn = (f.t / SPIN_PERIOD).fract();
+                c.arc(cx, ring_cy, 19.0 * s * f.cs, 2.5 * s * f.cs, INK, 0.95, turn, turn + 0.28);
+            }
+            Work::Attention => {
+                let phase = (f.t / PULSE_PERIOD * std::f32::consts::TAU).sin() * 0.5 + 0.5;
+                c.arc(cx, ring_cy, 19.0 * s * f.cs, 2.5 * s * f.cs, WATCH, 0.25 + 0.75 * phase, 0.0, 1.0);
+            }
+            Work::Idle => {}
         }
 
         let msize = (MARK * s * f.cs).round().max(1.0) as u32;
@@ -429,7 +511,7 @@ fn card_height(lay: &Layout, readings: &[(&str, Reading)]) -> f32 {
             h += BLOCK_GAP * s;
         }
         h += TITLE_PX * s + TITLE_GAP * s;
-        let rows = r.rows.len().max(1) as f32;
+        let rows = (r.rows.len() + r.sessions.len()).max(1) as f32;
         h += rows * ROW_PX * s + (rows - 1.0) * ROW_GAP * s;
     }
     h
@@ -458,12 +540,11 @@ fn draw_card(c: &mut Canvas, f: &Frame, font: &mut Text) {
         y += TITLE_PX * s;
         font.left_aligned(c, pretty(provider), text_left, y, TITLE_PX * s, INK, a);
         // A working provider says so next to its name, since the turning ring is easy to miss.
-        let tag = if r.work == Work::Running {
-            Some("working")
-        } else if r.stale {
-            Some("stale")
-        } else {
-            None
+        let tag = match r.work {
+            Work::Attention => Some("waiting on you"),
+            Work::Running => Some("working"),
+            Work::Idle if r.stale => Some("stale"),
+            Work::Idle => None,
         };
         if let Some(tag) = tag {
             let tw = font.width(tag, ROW_PX * s);
@@ -490,6 +571,19 @@ fn draw_card(c: &mut Canvas, f: &Frame, font: &mut Text) {
             font.left_aligned(c, &label, text_left, y, ROW_PX * s, MUTED, a);
             let tone = used.map(band).unwrap_or(MUTED);
             font.left_aligned(c, &value, text_right - vw, y, ROW_PX * s, tone, a);
+        }
+
+        // Live sessions below the limits: what is running, and what is waiting on an answer.
+        for (title, what) in &r.sessions {
+            y += ROW_GAP * s + ROW_PX * s;
+            let head = font.elide(title, ROW_PX * s, max_w * 0.45);
+            let pen = font.left_aligned(c, &head, text_left, y, ROW_PX * s, INK, a * 0.9);
+            let room = text_right - pen - 6.0 * s;
+            if room > 12.0 * s {
+                let detail = font.elide(what, ROW_PX * s, room);
+                let dw = font.width(&detail, ROW_PX * s);
+                font.left_aligned(c, &detail, text_right - dw, y, ROW_PX * s, MUTED, a);
+            }
         }
     }
 }
@@ -586,7 +680,18 @@ fn main() {
         // rings and no numbers, so this is a hard stop rather than a silent half-drawn panel.
         let Some(mut font) = Text::system() else { return };
 
-        let mut readings: Vec<(&str, Reading)> = providers.iter().map(|p| (*p, read_provider(p))).collect();
+        // Taking the hook port is what makes "waiting on you" possible: those events are the only
+        // thing that can tell a finished turn from one waiting for an answer. If the bind fails the
+        // original app still holds it, and the pill falls back to inferring from the transcripts —
+        // it keeps working, it just cannot show amber.
+        let hub = Arc::new(Hub::default());
+        let owns_hooks = hooks::start(hub.clone(), HOOK_PORT);
+        trace(&format!(
+            "start owns_hooks={owns_hooks} window={}x{} pill_left={:.0} hidden={hidden_x} shown={shown_x} y={y}",
+            lay.w, lay.h, lay.pill_left
+        ));
+
+        let mut readings: Vec<(&str, Reading)> = providers.iter().map(|p| (*p, read_provider(p, &hub))).collect();
         let mut last_poll = Instant::now();
 
         // One spring drives the reveal, a second the card, so the two can be at different points
@@ -617,6 +722,17 @@ fn main() {
                 DispatchMessageW(&msg);
             }
 
+            // A hook event is the whole point of holding the port: an answer waiting on the user
+            // should light up now, not on the next two-second tick.
+            if owns_hooks && hub.take_changed() {
+                readings = providers.iter().map(|p| (*p, read_provider(p, &hub))).collect();
+                trace(&format!(
+                    "hook event -> {}",
+                    readings.iter().map(|(p, r)| format!("{p}={:?}", r.work)).collect::<Vec<_>>().join(" ")
+                ));
+                dirty = true;
+            }
+
             if last_poll.elapsed() >= POLL {
                 last_poll = Instant::now();
                 let fresh = Cfg::load();
@@ -630,7 +746,7 @@ fn main() {
                     y = mon.top + ((mon.bottom - mon.top) as f32 * cfg.notch_y - lay.h as f32 / 2.0).round() as i32;
                     dirty = true;
                 }
-                let next: Vec<(&str, Reading)> = providers.iter().map(|p| (*p, read_provider(p))).collect();
+                let next: Vec<(&str, Reading)> = providers.iter().map(|p| (*p, read_provider(p, &hub))).collect();
                 let changed = next.len() != readings.len()
                     || next.iter().zip(&readings).any(|(a, b)| {
                         a.1.used != b.1.used || a.1.work != b.1.work || a.1.stale != b.1.stale
@@ -646,12 +762,20 @@ fn main() {
             let pad = HOVER_PAD * cfg.scale * dpi;
             // Hot area in screen coordinates: the pill alone, or the whole window once the card is
             // out. The card's empty column must not hold the pill open while it is shut.
-            let hot_left = pos + if card_open { 0.0 } else { lay.pill_left };
+            //
+            // The edge strip is folded in rather than used only while tucked away. Without it the
+            // pill flaps: the strip pulls it out, and a pointer resting on the strip is not yet
+            // inside the pill's own rectangle while that rectangle is still mostly off-screen, so
+            // it immediately decides to leave, and the spring hunts somewhere in the middle.
+            // Measured against where the pill is going, not where it currently is. Using the live
+            // position shrinks the hot area to the edge strip for as long as the pill is still on
+            // its way out, so a pointer that drifts twenty pixels mid-slide sends it back.
+            let edge_strip = hidden_x as f32 - 2.0;
+            let settled_left = shown_x as f32 + if card_open { 0.0 } else { lay.pill_left };
+            let hot_left = settled_left.min(edge_strip);
             let in_rows = (cur.y as f32) >= y as f32 - pad && (cur.y as f32) <= (y + lay.h) as f32 + pad;
-            let inside = in_rows && (cur.x as f32) >= hot_left - pad;
-            // While tucked away the trigger is the sliver at the very edge, not the pill's own
-            // rectangle, which is mostly off-screen by then.
-            let want = if shown { inside } else { in_rows && (cur.x as f32) >= hidden_x as f32 - 2.0 };
+            let want = in_rows && (cur.x as f32) >= hot_left - pad;
+            let inside = want;
 
             // Clicking the pill toggles the card. Read from the key state rather than a window
             // message: the window is click-through most of the time, so the message may never
@@ -664,6 +788,11 @@ fn main() {
             was_down = down;
 
             if want != shown {
+                trace(&format!(
+                    "hover {} cursor=({},{}) hot_left={hot_left:.0} pos={pos:.0} hidden={hidden_x} shown={shown_x} rows={in_rows}",
+                    if want { "enter" } else { "leave" },
+                    cur.x, cur.y
+                ));
                 shown = want;
                 // Only the constants change; the spring's value and velocity carry straight over,
                 // so a reversal keeps the momentum it already had.
@@ -698,7 +827,8 @@ fn main() {
             let (next_alpha, next_scale) = skin(open.value);
             let next_pos = hidden_x as f32 + (shown_x - hidden_x) as f32 * open.value;
             let next_card = card.value.clamp(0.0, 1.0);
-            let spinning = open.value > 0.02 && readings.iter().any(|(_, r)| r.work == Work::Running);
+            let animating_ring = open.value > 0.02
+                && readings.iter().any(|(_, r)| matches!(r.work, Work::Running | Work::Attention));
 
             let moved = (next_pos - pos).abs() > 0.01 || (next_alpha - alpha).abs() > 0.002;
             let rescaled = (next_scale - drawn_scale).abs() > 0.002 || (next_card - drawn_card).abs() > 0.002;
@@ -706,7 +836,7 @@ fn main() {
             alpha = next_alpha;
 
             // The working arc has to be redrawn every frame; everything else only when it changed.
-            if dirty || rescaled || spinning {
+            if dirty || rescaled || animating_ring {
                 render(
                     &mut canvas,
                     &Frame {
@@ -794,7 +924,7 @@ mod tests {
     }
 
     fn reading(used: Option<f32>, work: Work) -> Reading {
-        Reading { used, stale: false, rows: vec![("Current session".into(), used)], work }
+        Reading { used, stale: false, rows: vec![("Current session".into(), used)], work, sessions: Vec::new() }
     }
 
     // ------------------------------------------------------------ readings
@@ -995,6 +1125,50 @@ mod tests {
     fn content_starts_small_and_ends_full_size() {
         assert!((skin(0.0).1 - CONTENT_MIN_SCALE).abs() < 1e-3);
         assert!((skin(1.0).1 - 1.0).abs() < 0.01);
+    }
+
+    // ------------------------------------------------------------ hover
+
+    /// The rule the loop uses, lifted out so it can be checked without a window.
+    fn hot_left(shown_x: f32, pill_left: f32, hidden_x: f32, card_open: bool) -> f32 {
+        (shown_x + if card_open { 0.0 } else { pill_left }).min(hidden_x - 2.0)
+    }
+
+    #[test]
+    fn the_hot_area_does_not_shrink_while_the_pill_is_moving() {
+        // Two bugs met here. The pill used to flap, because the strip pulled it out and then the
+        // pointer on that strip was not yet inside the pill's own rectangle. Anchoring on the
+        // settled position fixes that and a second, subtler one: measured against the live
+        // position the hot area is only the strip until the pill lands, so a pointer drifting a
+        // few pixels mid-slide sent it straight back.
+        let (pill_left, hidden_x, shown_x) = (310.0, 3433.0, 3042.0);
+        let left = hot_left(shown_x, pill_left, hidden_x, false);
+        assert!(left <= hidden_x - 2.0, "the edge strip must stay hot");
+        assert!(
+            hidden_x - left > 60.0,
+            "the hot area should be the whole pill, not a sliver: {} px wide",
+            hidden_x - left
+        );
+        // Anything on the strip stays hot regardless of where the animation currently is.
+        for cursor in [3437.0, 3400.0, 3360.0] {
+            assert!(cursor >= left, "{cursor} should be inside a hot area starting at {left}");
+        }
+    }
+
+    #[test]
+    fn a_pointer_well_clear_of_the_edge_is_not_hot() {
+        let (pill_left, hidden_x, shown_x) = (310.0, 3433.0, 3042.0);
+        assert!(2000.0 < hot_left(shown_x, pill_left, hidden_x, false), "the desktop should be cold");
+        let _ = pill_left;
+    }
+
+    #[test]
+    fn an_open_card_widens_the_hot_area_to_the_whole_window() {
+        let (pill_left, hidden_x, shown_x) = (310.0, 3433.0, 3042.0);
+        let shut = hot_left(shown_x, pill_left, hidden_x, false);
+        let open = hot_left(shown_x, pill_left, hidden_x, true);
+        assert!(open < shut, "an open card must catch the pointer over its own column");
+        assert_eq!(open, shown_x, "which starts at the window's left edge");
     }
 
     // ------------------------------------------------------------ drawing

@@ -20,6 +20,11 @@ windows = { version = "0.58", features = [
 ] }
 resvg = { version = "0.48.1", default-features = false }
 ab_glyph = "0.2.32"
+tiny_http = "0.12"
+
+[dev-dependencies]
+# Only for the ported hook-server tests, which POST at the real socket rather than mocking it.
+ureq = "2"
 
 [[bin]]
 name = "codenotch-native"
