@@ -50,19 +50,34 @@ const MARK: f32 = 26.0;
 /// Radius of the concave arcs above and below the pill, from `--fillet` in notch.html.
 const FILLET: f32 = 26.0;
 
-// The detail card, to the left of the pill, from `#card` in notch.html.
-const CARD_W: f32 = 246.0;
+// The detail panels, to the left of the pill. One per provider rather than a single card holding
+// all of them: each provider is its own thing, and stacked blocks inside one box made the divisions
+// hard to see. Wider and larger than notch.html's `#card`, which was sized for hover rather than
+// for reading.
+const CARD_W: f32 = 320.0;
 const CARD_GAP: f32 = 12.0;
-const CARD_PAD: f32 = 16.0;
+const CARD_PAD: f32 = 18.0;
 const CARD_RADIUS: f32 = 16.0;
-const TITLE_PX: f32 = 14.0;
-const ROW_PX: f32 = 12.5;
-const TITLE_GAP: f32 = 8.0;
-const ROW_GAP: f32 = 5.0;
-const BLOCK_GAP: f32 = 14.0;
+/// Space between one provider's panel and the next.
+const CARD_STACK_GAP: f32 = 10.0;
+const TITLE_PX: f32 = 16.0;
+const ROW_PX: f32 = 13.0;
+const TITLE_GAP: f32 = 12.0;
+const ROW_GAP: f32 = 12.0;
+/// A usage bar reads at a glance; a number has to be compared against a limit you have to remember.
+const BAR_H: f32 = 7.0;
+const BAR_GAP: f32 = 6.0;
 
 const PEEK: f32 = 6.0; // how much stays on screen when tucked away
 const HOVER_PAD: f32 = 12.0;
+/// Extra room the pointer gets before the pill decides it has left. Without it a single threshold
+/// plus an unsteady hand is a switch being flicked: a pointer resting near the edge crosses it
+/// constantly and the pill flaps. Sized from a real trace, where a resting hand wandered about
+/// 70 px — a margin narrower than the wobble it is meant to absorb would not be a fix.
+const HOVER_HYSTERESIS: f32 = 80.0;
+/// And it has to stay outside for this long. Carried over from `LEAVE_MS` in the Tauri build, for
+/// the same reason: a pointer crossing the boundary on its way somewhere else is not a decision.
+const LEAVE_DWELL: Duration = Duration::from_millis(300);
 const TICK: Duration = Duration::from_millis(16);
 const POLL: Duration = Duration::from_secs(2);
 /// One turn of the working arc, matching `spin 1.2s` in notch.html.
@@ -383,28 +398,38 @@ fn skin(openness: f32) -> (f32, f32) {
 
 struct Layout {
     scale: f32,
-    /// Full window: the card's column plus the pill's.
+    /// Full window: the panels' column plus the pill's.
     w: i32,
     h: i32,
     /// Left edge of the pill within the window.
     pill_left: f32,
+    /// Top of the pill body inside the window, and its height. The pill is centred vertically,
+    /// because the panel stack beside it can be taller than the pill is.
+    pill_top: f32,
+    pill_h: f32,
     cell_h: f32,
     pct_px: f32,
 }
 
 impl Layout {
-    fn new(scale: f32, cells: usize) -> Layout {
+    /// `panels_h` is how tall the open panel stack needs to be, in scaled pixels. The window has to
+    /// cover whichever is taller, the pill or the panels, or the panels would be clipped.
+    fn new(scale: f32, cells: usize, panels_h: f32) -> Layout {
         let cells = cells.max(1) as f32;
         let cell_h = RING_BOX + TEXT_GAP + PCT_PX;
+        let pill_h = (PAD_Y * 2.0 + cells * cell_h + (cells - 1.0) * GAP) * scale;
         // The fillets live outside the pill at both ends, so the window is taller than the pill by
         // one fillet radius above and below.
-        let h = FILLET * 2.0 + PAD_Y * 2.0 + cells * cell_h + (cells - 1.0) * GAP;
+        let pill_block = pill_h + FILLET * 2.0 * scale;
+        let h = pill_block.max(panels_h);
         let w = CARD_W + CARD_GAP + PILL_W + 4.0;
         Layout {
             scale,
             w: (w * scale).round() as i32,
-            h: (h * scale).round() as i32,
+            h: h.round() as i32,
             pill_left: (CARD_W + CARD_GAP) * scale,
+            pill_top: ((h - pill_h) / 2.0).round(),
+            pill_h,
             cell_h,
             pct_px: (PCT_PX * scale).max(6.0),
         }
@@ -439,12 +464,12 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
     let toward_mid = |y: f32| mid + (y - mid) * f.cs;
 
     if f.card > 0.01 {
-        draw_card(c, f, font);
+        draw_panels(c, f, font);
     }
 
     // The pill body, pushed right by its radius so only the left corners round, as on screen.
-    let pill_top = FILLET * s;
-    let pill_bot = lay.h as f32 - FILLET * s;
+    let pill_top = lay.pill_top;
+    let pill_bot = lay.pill_top + lay.pill_h;
     c.round_rect(
         cx + RADIUS * s,
         (pill_top + pill_bot) / 2.0,
@@ -502,89 +527,120 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
     }
 }
 
-/// Height the card needs for its contents, in scaled pixels.
-fn card_height(lay: &Layout, readings: &[(&str, Reading)]) -> f32 {
+/// Height one provider's panel needs, in scaled pixels.
+fn panel_height(lay: &Layout, r: &Reading) -> f32 {
     let s = lay.scale;
+    let rows = r.rows.len().max(1) as f32;
     let mut h = CARD_PAD * 2.0 * s;
-    for (i, (_, r)) in readings.iter().enumerate() {
-        if i > 0 {
-            h += BLOCK_GAP * s;
-        }
-        h += TITLE_PX * s + TITLE_GAP * s;
-        let rows = (r.rows.len() + r.sessions.len()).max(1) as f32;
-        h += rows * ROW_PX * s + (rows - 1.0) * ROW_GAP * s;
+    h += TITLE_PX * s + TITLE_GAP * s;
+    // Each limit is a label line and the bar under it.
+    h += rows * (ROW_PX + BAR_GAP + BAR_H) * s + (rows - 1.0) * ROW_GAP * s;
+    if !r.sessions.is_empty() {
+        h += ROW_GAP * s;
+        h += r.sessions.len() as f32 * ROW_PX * s + (r.sessions.len() as f32 - 1.0) * ROW_GAP * 0.5 * s;
     }
     h
 }
 
-fn draw_card(c: &mut Canvas, f: &Frame, font: &mut Text) {
+/// The whole stack, so the window can be made tall enough before anything is drawn.
+fn panels_height(lay: &Layout, readings: &[(&str, Reading)]) -> f32 {
+    if readings.is_empty() {
+        return 0.0;
+    }
+    let gaps = (readings.len() - 1) as f32 * CARD_STACK_GAP * lay.scale;
+    readings.iter().map(|(_, r)| panel_height(lay, r)).sum::<f32>() + gaps
+}
+
+/// A usage bar: a dark track with the used fraction filled in its band colour. Reads at a glance,
+/// which a percentage does not — 47 % means nothing until you recall what the limit was.
+fn draw_bar(c: &mut Canvas, left: f32, top: f32, w: f32, h: f32, used: Option<f32>, a: f32) {
+    let r = h / 2.0;
+    c.round_rect(left + w / 2.0, top + r, w / 2.0, r, r, TRACK, None);
+    let Some(u) = used else { return };
+    let frac = u.clamp(0.0, 1.0);
+    if frac <= 0.0 {
+        return;
+    }
+    // Never thinner than its own cap, or a reading of 1 % draws a wedge instead of a dot.
+    let fill = (w * frac).max(h);
+    c.round_rect(left + fill / 2.0, top + r, fill / 2.0, r, r, band(u), None);
+    let _ = a;
+}
+
+/// One panel per provider, stacked and centred beside the pill.
+fn draw_panels(c: &mut Canvas, f: &Frame, font: &mut Text) {
     let (lay, s) = (f.lay, f.lay.scale);
-    let h = card_height(lay, f.readings);
     let w = CARD_W * s;
-    let top = (lay.h as f32 - h) / 2.0;
-    // The card slides the last few pixels in as it fades, so it arrives rather than blinking on.
-    let left = lay.pill_left - CARD_GAP * s - w + (1.0 - f.card) * 10.0 * s;
+    // The stack slides the last few pixels in as it fades, so it arrives rather than blinking on.
+    let left = lay.pill_left - CARD_GAP * s - w + (1.0 - f.card) * 12.0 * s;
     let a = f.card;
+    let total = panels_height(lay, f.readings);
+    let mut top = (lay.h as f32 - total) / 2.0;
 
-    c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, Some(PILL_EDGE));
+    for (provider, r) in f.readings {
+        let h = panel_height(lay, r);
+        c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, Some(PILL_EDGE));
 
-    let text_left = left + CARD_PAD * s;
-    let text_right = left + w - CARD_PAD * s;
-    let max_w = text_right - text_left;
-    let mut y = top + CARD_PAD * s;
+        let text_left = left + CARD_PAD * s;
+        let text_right = left + w - CARD_PAD * s;
+        let inner_w = text_right - text_left;
+        let mut y = top + CARD_PAD * s + TITLE_PX * s;
 
-    for (i, (provider, r)) in f.readings.iter().enumerate() {
-        if i > 0 {
-            y += BLOCK_GAP * s;
-        }
-        y += TITLE_PX * s;
         font.left_aligned(c, pretty(provider), text_left, y, TITLE_PX * s, INK, a);
-        // A working provider says so next to its name, since the turning ring is easy to miss.
         let tag = match r.work {
-            Work::Attention => Some("waiting on you"),
-            Work::Running => Some("working"),
-            Work::Idle if r.stale => Some("stale"),
+            Work::Attention => Some(("waiting on you", WATCH)),
+            Work::Running => Some(("working", INK)),
+            Work::Idle if r.stale => Some(("stale", MUTED)),
             Work::Idle => None,
         };
-        if let Some(tag) = tag {
+        if let Some((tag, tone)) = tag {
             let tw = font.width(tag, ROW_PX * s);
-            font.left_aligned(c, tag, text_right - tw, y, ROW_PX * s, MUTED, a * 0.9);
+            font.left_aligned(c, tag, text_right - tw, y, ROW_PX * s, tone, a);
         }
         y += TITLE_GAP * s;
 
         if r.rows.is_empty() {
             y += ROW_PX * s;
             font.left_aligned(c, "no reading", text_left, y, ROW_PX * s, MUTED, a);
-            continue;
         }
         for (n, (label, used)) in r.rows.iter().enumerate() {
             if n > 0 {
                 y += ROW_GAP * s;
             }
             y += ROW_PX * s;
+            // The percentage still sits at the end of the label line: the bar carries the shape,
+            // the number is there when the exact value matters.
             let value = pct_label(*used);
             let vw = font.width(&value, ROW_PX * s);
-            // The label is cut to whatever is left once the number has its room, so a long label
-            // can never push the percentage off the card.
-            let room = (max_w - vw - 8.0 * s).max(10.0);
+            let room = (inner_w - vw - 10.0 * s).max(10.0);
             let label = font.elide(label, ROW_PX * s, room);
             font.left_aligned(c, &label, text_left, y, ROW_PX * s, MUTED, a);
-            let tone = used.map(band).unwrap_or(MUTED);
-            font.left_aligned(c, &value, text_right - vw, y, ROW_PX * s, tone, a);
+            font.left_aligned(c, &value, text_right - vw, y, ROW_PX * s, MUTED, a);
+            y += BAR_GAP * s;
+            draw_bar(c, text_left, y, inner_w, BAR_H * s, *used, a);
+            y += BAR_H * s;
         }
 
         // Live sessions below the limits: what is running, and what is waiting on an answer.
-        for (title, what) in &r.sessions {
-            y += ROW_GAP * s + ROW_PX * s;
-            let head = font.elide(title, ROW_PX * s, max_w * 0.45);
-            let pen = font.left_aligned(c, &head, text_left, y, ROW_PX * s, INK, a * 0.9);
-            let room = text_right - pen - 6.0 * s;
-            if room > 12.0 * s {
-                let detail = font.elide(what, ROW_PX * s, room);
-                let dw = font.width(&detail, ROW_PX * s);
-                font.left_aligned(c, &detail, text_right - dw, y, ROW_PX * s, MUTED, a);
+        if !r.sessions.is_empty() {
+            y += ROW_GAP * s;
+            for (n, (title, what)) in r.sessions.iter().enumerate() {
+                if n > 0 {
+                    y += ROW_GAP * 0.5 * s;
+                }
+                y += ROW_PX * s;
+                let head = font.elide(title, ROW_PX * s, inner_w * 0.45);
+                let pen = font.left_aligned(c, &head, text_left, y, ROW_PX * s, INK, a * 0.9);
+                let room = text_right - pen - 8.0 * s;
+                if room > 12.0 * s {
+                    let detail = font.elide(what, ROW_PX * s, room);
+                    let dw = font.width(&detail, ROW_PX * s);
+                    font.left_aligned(c, &detail, text_right - dw, y, ROW_PX * s, MUTED, a);
+                }
             }
         }
+
+        top += h + CARD_STACK_GAP * s;
     }
 }
 
@@ -619,6 +675,24 @@ unsafe fn primary_monitor() -> (RECT, f32) {
     (rect, dpi)
 }
 
+/// Whether a process id is still running. Used to drop sessions whose owner is gone: a chat that
+/// asked a question and was then killed cannot still be waiting for the answer.
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            // Access denied means it exists but belongs to someone else; only a missing process
+            // counts as gone, or an elevated session would be dropped the moment it appeared.
+            Err(e) => e.code().0 as u32 == 0x8007_0005,
+        }
+    }
+}
+
 /// Most of this window is transparent. Without this, every click in the card's empty column would
 /// land here instead of on whatever is behind it, so the window is click-through except when the
 /// pointer is actually over something solid.
@@ -650,10 +724,11 @@ fn main() {
         let (mon, dpi) = primary_monitor();
         // The config scale is the user's size preference; the monitor scale converts design pixels
         // to this display's physical ones. Both multiply.
-        let mut lay = Layout::new(cfg.scale * dpi, providers.len());
-        let mut shown_x = mon.right - lay.w;
+        // A first pass with no panels, only so there is a Layout to measure them against; the
+        // real height lands on the next line, once the readings are known.
+        let mut lay = Layout::new(cfg.scale * dpi, providers.len(), 0.0);
         let mut hidden_x = mon.right - (PEEK * cfg.scale * dpi).round() as i32;
-        let mut y = mon.top + ((mon.bottom - mon.top) as f32 * cfg.notch_y - lay.h as f32 / 2.0).round() as i32;
+        let y0 = mon.top + ((mon.bottom - mon.top) as f32 * cfg.notch_y - lay.h as f32 / 2.0).round() as i32;
 
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
@@ -661,7 +736,7 @@ fn main() {
             w!("Codenotch"),
             WS_POPUP,
             hidden_x,
-            y,
+            y0,
             lay.w,
             lay.h,
             None,
@@ -686,12 +761,34 @@ fn main() {
         // it keeps working, it just cannot show amber.
         let hub = Arc::new(Hub::default());
         let owns_hooks = hooks::start(hub.clone(), HOOK_PORT);
+        // Stale session cleanup, on the same 30 s beat the Tauri build uses. Without it the table
+        // only ever grows: a running session never falls back to idle, a finished one is never
+        // removed, and a session stuck on attention paints the ring amber for ever.
+        {
+            let hub = hub.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                let changed = {
+                    let Ok(mut store) = hub.store.lock() else { continue };
+                    let a = store.sweep();
+                    let b = store.sweep_stuck(pid_alive);
+                    a || b
+                };
+                if changed {
+                    hub.mark_changed();
+                }
+            });
+        }
+
+
+        let mut readings: Vec<(&str, Reading)> = providers.iter().map(|p| (*p, read_provider(p, &hub))).collect();
+        lay = Layout::new(cfg.scale * dpi, providers.len(), panels_height(&lay, &readings));
+        let mut shown_x = mon.right - lay.w;
+        let mut y = mon.top + ((mon.bottom - mon.top) as f32 * cfg.notch_y - lay.h as f32 / 2.0).round() as i32;
         trace(&format!(
             "start owns_hooks={owns_hooks} window={}x{} pill_left={:.0} hidden={hidden_x} shown={shown_x} y={y}",
             lay.w, lay.h, lay.pill_left
         ));
-
-        let mut readings: Vec<(&str, Reading)> = providers.iter().map(|p| (*p, read_provider(p, &hub))).collect();
         let mut last_poll = Instant::now();
 
         // One spring drives the reveal, a second the card, so the two can be at different points
@@ -701,6 +798,8 @@ fn main() {
         let mut shown = false;
         let mut card_open = false;
         let mut was_down = false;
+        // When the pointer first went outside, or None while it is inside.
+        let mut left_at: Option<Instant> = None;
         let mut click_through = true;
         let mut dirty = true;
         let mut pos = hidden_x as f32;
@@ -739,7 +838,7 @@ fn main() {
                 if fresh.scale != cfg.scale || fresh.providers() != providers {
                     cfg = fresh;
                     providers = cfg.providers();
-                    lay = Layout::new(cfg.scale * dpi, providers.len());
+                    lay = Layout::new(cfg.scale * dpi, providers.len(), panels_height(&lay, &readings));
                     canvas = Canvas::new(lay.w, lay.h);
                     shown_x = mon.right - lay.w;
                     hidden_x = mon.right - (PEEK * cfg.scale * dpi).round() as i32;
@@ -753,6 +852,15 @@ fn main() {
                     });
                 if changed {
                     readings = next;
+                    // The panels can change height — a session appearing adds a line — and the
+                    // window has to be tall enough for them or they get clipped.
+                    let wanted = Layout::new(cfg.scale * dpi, providers.len(), panels_height(&lay, &readings));
+                    if wanted.h != lay.h {
+                        lay = wanted;
+                        canvas = Canvas::new(lay.w, lay.h);
+                        shown_x = mon.right - lay.w;
+                        y = mon.top + ((mon.bottom - mon.top) as f32 * cfg.notch_y - lay.h as f32 / 2.0).round() as i32;
+                    }
                     dirty = true;
                 }
             }
@@ -773,9 +881,31 @@ fn main() {
             let edge_strip = hidden_x as f32 - 2.0;
             let settled_left = shown_x as f32 + if card_open { 0.0 } else { lay.pill_left };
             let hot_left = settled_left.min(edge_strip);
-            let in_rows = (cur.y as f32) >= y as f32 - pad && (cur.y as f32) <= (y + lay.h) as f32 + pad;
-            let want = in_rows && (cur.x as f32) >= hot_left - pad;
-            let inside = want;
+            // Asymmetric on purpose: harder to leave than to arrive. The boundary to cross going
+            // out sits further in than the one coming back, so a hand that is not perfectly still
+            // cannot straddle both.
+            let edge = if shown { hot_left - pad - HOVER_HYSTERESIS } else { hot_left - pad };
+            let in_rows = (cur.y as f32) >= y as f32 - pad - if shown { HOVER_HYSTERESIS } else { 0.0 }
+                && (cur.y as f32) <= (y + lay.h) as f32 + pad + if shown { HOVER_HYSTERESIS } else { 0.0 };
+            let inside = in_rows && (cur.x as f32) >= edge;
+
+            // Leaving waits; arriving does not. A pointer on its way past should not open it, but
+            // it definitely should not close it either.
+            let want = if inside {
+                left_at = None;
+                true
+            } else if !shown {
+                false
+            } else {
+                match left_at {
+                    Some(t) if t.elapsed() >= LEAVE_DWELL => false,
+                    Some(_) => true,
+                    None => {
+                        left_at = Some(Instant::now());
+                        true
+                    }
+                }
+            };
 
             // Clicking the pill toggles the card. Read from the key state rather than a window
             // message: the window is click-through most of the time, so the message may never
@@ -1014,34 +1144,67 @@ mod tests {
 
     #[test]
     fn the_pill_grows_by_one_cell_per_provider() {
-        let one = Layout::new(1.0, 1);
-        let two = Layout::new(1.0, 2);
+        let one = Layout::new(1.0, 1, 0.0);
+        let two = Layout::new(1.0, 2, 0.0);
         assert!(two.h > one.h, "two providers must be taller than one");
         assert_eq!(two.w, one.w, "width is fixed by the card and the pill, not the cell count");
     }
 
     #[test]
     fn scale_shrinks_both_axes() {
-        let big = Layout::new(1.0, 2);
-        let small = Layout::new(0.8, 2);
+        let big = Layout::new(1.0, 2, 0.0);
+        let small = Layout::new(0.8, 2, 0.0);
         assert!(small.w < big.w && small.h < big.h);
     }
 
     #[test]
     fn the_window_is_wide_enough_for_the_card_beside_the_pill() {
-        let lay = Layout::new(1.0, 2);
+        let lay = Layout::new(1.0, 2, 0.0);
         assert!(lay.pill_left > CARD_W, "the card must fit to the left of the pill");
         assert!((lay.w as f32) - lay.pill_left >= PILL_W, "and the pill must still fit");
     }
 
     #[test]
-    fn the_card_grows_with_the_rows_it_has_to_show() {
-        let lay = Layout::new(1.0, 1);
-        let one = [("claude", reading(Some(0.2), Work::Idle))];
+    fn a_panel_grows_with_the_rows_it_has_to_show() {
+        let lay = Layout::new(1.0, 1, 0.0);
+        let one = reading(Some(0.2), Work::Idle);
         let mut wide = reading(Some(0.2), Work::Idle);
         wide.rows = (0..4).map(|i| (format!("row {i}"), Some(0.1))).collect();
-        let many = [("claude", wide)];
-        assert!(card_height(&lay, &many) > card_height(&lay, &one));
+        assert!(panel_height(&lay, &wide) > panel_height(&lay, &one));
+    }
+
+    #[test]
+    fn each_provider_gets_its_own_panel() {
+        // One box per provider, not one box with blocks inside: the stack is the sum of the panels
+        // plus the gaps between them.
+        let lay = Layout::new(1.0, 2, 0.0);
+        let r = || reading(Some(0.2), Work::Idle);
+        let one = [("claude", r())];
+        let two = [("claude", r()), ("codex", r())];
+        let stacked = panels_height(&lay, &two);
+        assert!(
+            stacked >= panels_height(&lay, &one) * 2.0 + CARD_STACK_GAP,
+            "two panels should be two panels plus a gap, got {stacked}"
+        );
+    }
+
+    #[test]
+    fn the_window_grows_when_the_panels_outgrow_the_pill() {
+        // The panels sit beside the pill, so anything taller than it would be clipped by a window
+        // sized for the pill alone.
+        let tight = Layout::new(1.0, 1, 0.0);
+        let roomy = Layout::new(1.0, 1, tight.h as f32 + 200.0);
+        assert!(roomy.h > tight.h, "the window must cover the taller of the two");
+        assert!(roomy.pill_top > tight.pill_top, "and the pill stays centred in it");
+    }
+
+    #[test]
+    fn a_sessions_list_makes_its_panel_taller() {
+        let lay = Layout::new(1.0, 1, 0.0);
+        let quiet = reading(Some(0.2), Work::Idle);
+        let mut busy = reading(Some(0.2), Work::Running);
+        busy.sessions = vec![("proj".into(), "working".into()), ("outro".into(), "waiting".into())];
+        assert!(panel_height(&lay, &busy) > panel_height(&lay, &quiet));
     }
 
     // ------------------------------------------------------------ animation
@@ -1155,6 +1318,32 @@ mod tests {
         }
     }
 
+    /// The two thresholds the loop uses: it is harder to leave than to arrive.
+    fn edge_for(shown: bool, hot_left: f32, pad: f32) -> f32 {
+        if shown { hot_left - pad - HOVER_HYSTERESIS } else { hot_left - pad }
+    }
+
+    #[test]
+    fn a_jittery_pointer_on_the_boundary_cannot_make_it_flap() {
+        // Measured from a real trace: a hand resting near the edge wandered over roughly 40 px and
+        // crossed a single threshold seventeen times in six seconds, and the pill flapped with it.
+        let (hot_left, pad) = (3351.0, 14.4);
+        let enter = edge_for(false, hot_left, pad);
+        let leave = edge_for(true, hot_left, pad);
+        assert!(leave < enter, "leaving must be the harder of the two");
+
+        // Everything the observed hand touched, once open, stays open.
+        for cursor in [3299.0, 3307.0, 3320.0, 3330.0, 3348.0, 3368.0] {
+            assert!(cursor >= leave, "{cursor} would have closed it again");
+        }
+    }
+
+    #[test]
+    fn the_hysteresis_is_wider_than_the_wobble_it_absorbs() {
+        // The trace's spread; the margin has to cover it or the fix does not hold.
+        assert!(HOVER_HYSTERESIS > 3368.0 - 3299.0 - 14.4, "margin too tight for a real hand");
+    }
+
     #[test]
     fn a_pointer_well_clear_of_the_edge_is_not_hot() {
         let (pill_left, hidden_x, shown_x) = (310.0, 3433.0, 3042.0);
@@ -1193,7 +1382,7 @@ mod tests {
     fn rendering_actually_puts_pixels_in_the_buffer() {
         // Splits render() from the blit: if this passes and nothing shows on screen, the fault is
         // in UpdateLayeredWindow, not in the painting.
-        let lay = Layout::new(1.2, 2);
+        let lay = Layout::new(1.2, 2, 0.0);
         let readings = vec![("claude", reading(Some(0.2), Work::Idle)), ("codex", reading(Some(0.02), Work::Idle))];
         let c = paint(&lay, &readings, 0.0, 0.0);
 
@@ -1205,14 +1394,14 @@ mod tests {
 
     #[test]
     fn a_shut_card_paints_nothing_on_the_left() {
-        let lay = Layout::new(1.0, 1);
+        let lay = Layout::new(1.0, 1, 0.0);
         let readings = vec![("claude", reading(Some(0.2), Work::Idle))];
         assert_eq!(left_ink(&paint(&lay, &readings, 0.0, 0.0), &lay), 0, "the card's column must be empty while shut");
     }
 
     #[test]
     fn an_open_card_paints_to_the_left_of_the_pill() {
-        let lay = Layout::new(1.0, 1);
+        let lay = Layout::new(1.0, 1, 0.0);
         let readings = vec![("claude", reading(Some(0.2), Work::Idle))];
         let ink = left_ink(&paint(&lay, &readings, 1.0, 0.0), &lay);
         assert!(ink > 1000, "an open card should fill its column, got {ink} pixels");
@@ -1221,7 +1410,7 @@ mod tests {
     #[test]
     fn the_working_arc_turns_over_time() {
         // Two frames a third of a turn apart must not be identical, or the ring is frozen.
-        let lay = Layout::new(1.0, 1);
+        let lay = Layout::new(1.0, 1, 0.0);
         let readings = vec![("claude", reading(Some(0.2), Work::Running))];
         let a = paint(&lay, &readings, 0.0, 0.0);
         let b = paint(&lay, &readings, 0.0, SPIN_PERIOD / 3.0);
@@ -1232,7 +1421,7 @@ mod tests {
     fn an_idle_provider_draws_the_same_frame_every_time() {
         // The inverse: nothing animates when no turn is in progress, or the loop would repaint
         // forever and the idle CPU saving would disappear.
-        let lay = Layout::new(1.0, 1);
+        let lay = Layout::new(1.0, 1, 0.0);
         let readings = vec![("claude", reading(Some(0.2), Work::Idle))];
         let a = paint(&lay, &readings, 0.0, 0.0);
         let b = paint(&lay, &readings, 0.0, 9.0);

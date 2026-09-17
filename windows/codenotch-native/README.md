@@ -21,8 +21,9 @@ sem tocar no `dwm.exe`.
 - Card de detalhes: clique na pill abre, clique de novo fecha, sair com o mouse fecha
 - Anel girando enquanto ha um turno em andamento, e anel ambar pulsando quando
   uma sessao espera resposta sua
-- Servidor de hooks na porta 48666: recebe os eventos do Claude Code direto,
-  entao o card lista as sessoes vivas e o que cada uma esta fazendo
+- Servidor de hooks na porta 48666: recebe os eventos do Claude Code direto
+- Um painel por provider, cada um com uma barra de uso por limite e a lista de
+  sessoes vivas com o que cada uma esta fazendo
 
 ## O que ainda nao faz
 

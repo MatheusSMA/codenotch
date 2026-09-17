@@ -24,6 +24,11 @@ impl Hub {
     pub fn take_changed(&self) -> bool {
         self.changed.swap(false, Ordering::Relaxed)
     }
+
+    /// Raised by anything that edits the table outside a request — the stale-session sweeper.
+    pub fn mark_changed(&self) {
+        self.changed.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Binds the hook port. Returns false when something else already holds it — which in practice

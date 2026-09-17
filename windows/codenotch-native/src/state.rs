@@ -1,8 +1,14 @@
-//! Session table, copied verbatim from the Tauri build's `state.rs`.
+//! Session table, taken from the Tauri build's `state.rs`.
 //!
-//! It had no Tauri dependency to begin with, so it moves across untouched: the same hook events
-//! produce the same state machine, and any drift between the two builds would be a bug rather than
-//! a feature. Parts of it serve the upstream UI and are unused here.
+//! It had no Tauri dependency to begin with, so it moves across as-is: the same hook events produce
+//! the same state machine, and drift between the two builds would be a bug rather than a feature.
+//! Parts of it serve the upstream UI and are unused here.
+//!
+//! One deliberate addition, `sweep_stuck` at the bottom. Upstream `sweep` expires running, idle and
+//! done sessions but never `attention`, so a session that asks a question and is then killed —
+//! or one created by an event with no follow-up — stays amber for ever, and because the aggregate
+//! ranks attention above everything, one stuck session paints the whole ring amber while real work
+//! is running.
 #![allow(dead_code)]
 
 //! Four-state machine: attention > running > done > idle (ordered by attention cost).
@@ -286,5 +292,109 @@ impl Store {
             clock_24h,
             drag,
         }
+    }
+}
+
+/// Attention with no further event for this long is treated as abandoned rather than waiting.
+/// Generous on purpose: a question can legitimately go unanswered for a while, and this is only a
+/// backstop for sessions that will never report again.
+const ATTENTION_STALE_MS: u64 = 45 * 60 * 1000;
+
+impl Store {
+    /// The gap in upstream's `sweep`: sessions that can no longer be waiting on anyone.
+    ///
+    /// Two rules. A session whose owning process is gone is dropped outright, whatever it claimed
+    /// last — this is exact rather than a guess, which is why it comes first. A session still
+    /// claiming attention long after its last event falls back to idle, where the normal rules
+    /// eventually remove it.
+    ///
+    /// `alive` answers whether a pid is still running; a `ppid` of 0 means unknown and is never
+    /// judged by it.
+    pub fn sweep_stuck<F: Fn(u32) -> bool>(&mut self, alive: F) -> bool {
+        let now = now_ms();
+        let before = self.map.len();
+        self.map.retain(|_, s| s.ppid == 0 || alive(s.ppid));
+        let mut changed = self.map.len() != before;
+        for s in self.map.values_mut() {
+            if s.state == ST_ATTENTION && now.saturating_sub(s.last_event) > ATTENTION_STALE_MS {
+                s.state = ST_IDLE.into();
+                s.attn.clear();
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+#[cfg(test)]
+mod stuck_tests {
+    use super::*;
+
+    fn session(id: &str, state: &str, ppid: u32, age_ms: u64) -> Session {
+        Session {
+            id: id.into(),
+            title: id.into(),
+            state: state.into(),
+            started: 0,
+            total: 0,
+            last: String::new(),
+            attn: "waiting".into(),
+            prompt: String::new(),
+            model: String::new(),
+            ppid,
+            last_event: now_ms().saturating_sub(age_ms),
+            cwd: String::new(),
+            last_hook: 0,
+        }
+    }
+
+    fn store_with(sessions: Vec<Session>) -> Store {
+        let mut st = Store::default();
+        for s in sessions {
+            st.map.insert(s.id.clone(), s);
+        }
+        st
+    }
+
+    #[test]
+    fn a_session_whose_process_is_gone_is_dropped() {
+        let mut st = store_with(vec![session("dead", ST_ATTENTION, 4242, 0)]);
+        assert!(st.sweep_stuck(|_| false));
+        assert_eq!(st.snapshot("en", "en", true, false).sessions.len(), 0);
+    }
+
+    #[test]
+    fn a_live_process_is_left_alone() {
+        let mut st = store_with(vec![session("live", ST_ATTENTION, 4242, 0)]);
+        assert!(!st.sweep_stuck(|_| true));
+        assert_eq!(st.snapshot("en", "en", true, false).agg, ST_ATTENTION);
+    }
+
+    #[test]
+    fn an_unknown_pid_is_never_judged_by_liveness() {
+        // ppid 0 means the event did not say; dropping those would clear real sessions.
+        let mut st = store_with(vec![session("unknown", ST_ATTENTION, 0, 0)]);
+        st.sweep_stuck(|_| false);
+        assert_eq!(st.snapshot("en", "en", true, false).sessions.len(), 1);
+    }
+
+    #[test]
+    fn attention_that_never_reports_again_stops_being_amber() {
+        // The bug this exists for: one stuck session outranks every running one, so the whole ring
+        // sits amber while real work is going on.
+        let mut st = store_with(vec![
+            session("stuck", ST_ATTENTION, 0, ATTENTION_STALE_MS + 1),
+            session("busy", ST_RUNNING, 0, 0),
+        ]);
+        assert_eq!(st.snapshot("en", "en", true, false).agg, ST_ATTENTION, "before the sweep");
+        assert!(st.sweep_stuck(|_| true));
+        assert_eq!(st.snapshot("en", "en", true, false).agg, ST_RUNNING, "running should win now");
+    }
+
+    #[test]
+    fn a_recent_question_keeps_waiting() {
+        let mut st = store_with(vec![session("asking", ST_ATTENTION, 0, 60 * 1000)]);
+        assert!(!st.sweep_stuck(|_| true));
+        assert_eq!(st.snapshot("en", "en", true, false).agg, ST_ATTENTION);
     }
 }
