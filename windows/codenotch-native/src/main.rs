@@ -114,8 +114,12 @@ fn trace(line: &str) {
 // the part nobody enjoys.
 const REVEAL_RESPONSE: f32 = 0.34; // seconds for one oscillation
 const REVEAL_DAMPING: f32 = 0.72; // below 1.0, so it passes the target once
-const DISMISS_RESPONSE: f32 = 0.24;
+const DISMISS_RESPONSE: f32 = 0.34;
 const DISMISS_DAMPING: f32 = 1.0; // critically damped: straight home, no bounce
+/// While a panel is still on screen the pill stays out, however the pointer left. The panel is
+/// drawn inside the window, so retracting first does not animate it away — it drags it off the
+/// edge, and what the eye sees is the panel being cut rather than closing.
+const PANEL_LINGER: f32 = 0.04;
 
 /// The sliver left at the edge is faint rather than invisible: it has to be findable, or the hover
 /// target is a secret. Raise it if it needs to be more obvious, drop it to 0.0 to hide it outright.
@@ -465,6 +469,19 @@ fn next_panel(current: Option<usize>, hit: Option<usize>) -> Option<usize> {
         (_, Some(i)) => Some(i),
         (open, None) => open,
     }
+}
+
+/// Where the panel spring is headed. Open only when what is drawn is what was asked for: during a
+/// swap the two differ, and the panel shuts on its way to the other one.
+fn card_target(shown: Option<usize>, want: Option<usize>) -> f32 {
+    if shown.is_some() && shown == want { 1.0 } else { 0.0 }
+}
+
+/// Where the pill spring is headed. Out while the pointer is on it, and for as long as a panel is
+/// still on screen — the panel lives inside this window, so retracting first carries it off the
+/// edge instead of letting it close.
+fn pill_target(pointer_inside: bool, card: f32) -> f32 {
+    if pointer_inside || card > PANEL_LINGER { 1.0 } else { 0.0 }
 }
 
 fn pct_label(used: Option<f32>) -> String {
@@ -832,7 +849,10 @@ fn main() {
         let mut card = Spring::new(0.0, REVEAL_RESPONSE, DISMISS_DAMPING);
         let mut shown = false;
         // Which ring's panel is out, if any.
-        let mut card_open: Option<usize> = None;
+        // What the pointer asked for, and what is actually drawn. They differ only while one panel
+        // is closing to let another open — a swap is a close and an open, not a jump cut.
+        let mut panel_want: Option<usize> = None;
+        let mut panel_shown: Option<usize> = None;
         let mut was_down = false;
         // When the pointer first went outside, or None while it is inside.
         let mut left_at: Option<Instant> = None;
@@ -925,7 +945,7 @@ fn main() {
             // position shrinks the hot area to the edge strip for as long as the pill is still on
             // its way out, so a pointer that drifts twenty pixels mid-slide sends it back.
             let edge_strip = hidden_x as f32 - 2.0;
-            let settled_left = shown_x as f32 + if card_open.is_some() { 0.0 } else { lay.pill_left };
+            let settled_left = shown_x as f32 + if panel_shown.is_some() { 0.0 } else { lay.pill_left };
             let hot_left = settled_left.min(edge_strip);
             // Asymmetric on purpose: harder to leave than to arrive. The boundary to cross going
             // out sits further in than the one coming back, so a hand that is not perfectly still
@@ -962,8 +982,8 @@ fn main() {
                 // Which ring was hit decides which panel opens; clicking the open one shuts it,
                 // and clicking a different ring swaps rather than stacking a second panel.
                 let hit = lay.cell_at(cur.y as f32 - y as f32, readings.len());
-                card_open = next_panel(card_open, hit);
-                trace(&format!("click cell={hit:?} panel={card_open:?}"));
+                panel_want = next_panel(panel_want, hit);
+                trace(&format!("click cell={hit:?} panel={panel_want:?}"));
             }
             was_down = down;
 
@@ -980,8 +1000,8 @@ fn main() {
                 open.damping = if shown { REVEAL_DAMPING } else { DISMISS_DAMPING };
             }
             // Leaving closes the panel too: it must not be left hanging open off the edge.
-            if !shown && card_open.is_some() {
-                card_open = None;
+            if !shown && panel_want.is_some() {
+                panel_want = None;
             }
 
             // Solid only where something is drawn, so clicks elsewhere reach the desktop.
@@ -995,13 +1015,22 @@ fn main() {
             let dt = (now - last_frame).as_secs_f32().min(0.05); // a stall must not launch the spring
             last_frame = now;
 
-            let open_target = if shown { 1.0 } else { 0.0 };
-            let card_target = if card_open.is_some() { 1.0 } else { 0.0 };
+            // The panel closes before it swaps: the box shrinks away, the contents change at the
+            // bottom of that dip, and it opens again. Changing them mid-flight would be a cut.
+            let card_to = card_target(panel_shown, panel_want);
+            if !card.settled(card_to) {
+                card.step(card_to, dt);
+            }
+            if card.value < 0.02 && panel_shown != panel_want {
+                panel_shown = panel_want;
+                card.vel = 0.0;
+            }
+
+            // The pill waits for the panel to finish leaving before it retracts, or the panel goes
+            // out of the frame instead of out of the way.
+            let open_target = pill_target(shown, card.value);
             if !open.settled(open_target) {
                 open.step(open_target, dt);
-            }
-            if !card.settled(card_target) {
-                card.step(card_target, dt);
             }
 
             let (next_alpha, next_scale) = skin(open.value);
@@ -1031,7 +1060,7 @@ fn main() {
                         readings: &readings,
                         cs: next_scale,
                         card: next_card,
-                        panel: card_open,
+                        panel: panel_shown,
                         t: start.elapsed().as_secs_f32(),
                     },
                     &mut marks,
@@ -1252,6 +1281,37 @@ mod tests {
         let need = panels_height(&lay, &both);
         assert_eq!(need, panel_height(&lay, &both[0].1), "the tallest one decides");
         assert!(need < panel_height(&lay, &both[0].1) + panel_height(&lay, &both[1].1));
+    }
+
+    #[test]
+    fn the_pill_waits_for_the_panel_to_finish_leaving() {
+        // The panel is drawn inside this window. Retracting while it is still visible does not
+        // animate it away, it drags it off the edge — which is what "it does not leave the way it
+        // arrived" looked like.
+        assert_eq!(pill_target(false, 1.0), 1.0, "pointer gone but panel still open");
+        assert_eq!(pill_target(false, 0.3), 1.0, "still closing");
+        assert_eq!(pill_target(false, 0.0), 0.0, "panel gone, now it may retract");
+        assert_eq!(pill_target(true, 0.0), 1.0, "pointer on it");
+    }
+
+    #[test]
+    fn a_swap_closes_before_it_opens() {
+        // Drawn panel and wanted panel differ only mid-swap, and the box is shut for that stretch.
+        assert_eq!(card_target(Some(0), Some(0)), 1.0, "settled open");
+        assert_eq!(card_target(Some(0), Some(1)), 0.0, "on its way to the other one");
+        assert_eq!(card_target(Some(0), None), 0.0, "closing for good");
+        assert_eq!(card_target(None, Some(1)), 0.0, "nothing drawn yet");
+    }
+
+    #[test]
+    fn leaving_is_no_longer_quicker_than_arriving_by_much() {
+        // It used to snap away. Still shorter than the entrance — waiting for something to finish
+        // disappearing is nobody's favourite — but no longer a third of it.
+        assert!(DISMISS_RESPONSE <= REVEAL_RESPONSE, "leaving should not outlast arriving");
+        assert!(
+            DISMISS_RESPONSE >= REVEAL_RESPONSE * 0.75,
+            "and should not be a snap either: {DISMISS_RESPONSE} against {REVEAL_RESPONSE}"
+        );
     }
 
     #[test]
