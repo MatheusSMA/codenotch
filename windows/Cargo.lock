@@ -552,7 +552,9 @@ name = "codenotch-native"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "chrono",
  "dirs 5.0.1",
+ "native-tls",
  "resvg",
  "serde",
  "serde_json",

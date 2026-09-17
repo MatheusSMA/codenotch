@@ -21,10 +21,11 @@ windows = { version = "0.58", features = [
 resvg = { version = "0.48.1", default-features = false }
 ab_glyph = "0.2.32"
 tiny_http = "0.12"
-
-[dev-dependencies]
-# Only for the ported hook-server tests, which POST at the real socket rather than mocking it.
-ureq = "2"
+# The usage fetcher talks to api.anthropic.com. native-tls for the same reason upstream gives:
+# the Antigravity bridge's self-signed certificate, accepted for loopback only.
+ureq = { version = "2", features = ["json", "native-tls"] }
+native-tls = "0.2"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 
 [[bin]]
 name = "codenotch-native"

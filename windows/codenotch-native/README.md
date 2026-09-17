@@ -25,13 +25,15 @@ sem tocar no `dwm.exe`.
 - Um painel por provider, cada um com uma barra de uso por limite e a lista de
   sessoes vivas com o que cada uma esta fazendo
 
+- Busca os proprios numeros: `usage.rs` e `codex.rs` vieram do build Tauri com as
+  mesmas tres linhas trocadas por um Hub. O app original nao precisa mais rodar.
+
 ## O que ainda nao faz
 
-- **Nao busca os numeros de uso.** Le os snapshots que o app original persiste
-  (`usage.json`, `codex.json`). Sem ele rodando eles congelam, e a notch passa a
-  mostra-los esmaecidos, como o build web faz com um `stale`. Portar `usage.rs` e
-  `codex.rs` (~57 KB) e o que falta para ficar sozinho de vez.
-- Sem icone de bandeja e sem tela de configuracoes.
+- Sem icone de bandeja e sem tela de configuracoes. Editar `config.json` na mao
+  funciona (cuidado com o BOM: o parser serde rejeita).
+- Cursor e Antigravity nao tem buscador aqui; se quiser esses dois, ainda e o app
+  original que os escreve.
 
 ## Sobre a porta 48666
 

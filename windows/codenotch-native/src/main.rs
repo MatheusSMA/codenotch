@@ -12,11 +12,13 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod activity;
+mod codex;
 mod glyphs;
 mod hooks;
 mod paint;
 mod state;
 mod text;
+mod usage;
 
 use activity::Work;
 use glyphs::Marks;
@@ -94,7 +96,7 @@ const HOOK_PORT: u16 = 48666;
 /// Poking at this window from outside is unreliable — it is per-monitor DPI aware while most tools
 /// are not, so a cursor read from another process does not agree with what this one sees. Asking
 /// the app what it thinks is the only account that means anything.
-fn trace(line: &str) {
+pub(crate) fn trace(line: &str) {
     if std::env::var_os("CODENOTCH_TRACE").is_none() {
         return;
     }
@@ -185,7 +187,7 @@ struct Reading {
 /// Five minutes, the window `staleOf` in notch.html uses before it stops trusting a reading.
 const STALE_AFTER_MS: i64 = 5 * 60 * 1000;
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_default().join("codenotch")
 }
 
@@ -853,6 +855,12 @@ fn main() {
         // it keeps working, it just cannot show amber.
         let hub = Arc::new(Hub::default());
         let owns_hooks = hooks::start(hub.clone(), HOOK_PORT);
+        // The usage fetcher. It persists usage.json, which is what the pill reads, so taking the
+        // port stops meaning frozen numbers: this binary now refreshes them itself.
+        hub.usage.lock().map(|mut u| *u = usage::load_persisted()).ok();
+        usage::start(hub.clone());
+        hub.codex.lock().map(|mut u| *u = codex::load_persisted()).ok();
+        codex::start(hub.clone());
         // Stale session cleanup, on the same 30 s beat the Tauri build uses. Without it the table
         // only ever grows: a running session never falls back to idle, a finished one is never
         // removed, and a session stuck on attention paints the ring amber for ever.
@@ -904,11 +912,16 @@ fn main() {
         let mut drawn_card = 0.0f32;
         let start = Instant::now();
         let mut last_frame = Instant::now();
+        let mut surface: Option<Surface> = None;
 
         loop {
+            let frame_start = Instant::now();
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
+                    if let Some(sfc) = surface.take() {
+                        sfc.release(memdc);
+                    }
                     let _ = DeleteDC(memdc);
                     ReleaseDC(None, screen);
                     return;
@@ -1112,28 +1125,26 @@ fn main() {
                 drawn_card = next_card;
                 dirty = false;
             } else if !moved {
-                // Nothing changed: skip the DIB and the blit entirely, which is what keeps this at
-                // roughly no CPU while it sits at the edge.
-                std::thread::sleep(TICK);
+                // Nothing changed: skip the blit entirely, which is what keeps this at roughly no
+                // CPU while it sits at the edge.
+                let spent = frame_start.elapsed();
+                if spent < TICK {
+                    std::thread::sleep(TICK - spent);
+                }
                 continue;
             }
 
-            let bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: lay.w,
-                    biHeight: -lay.h,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            if let Ok(dib) = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
-                std::ptr::copy_nonoverlapping(canvas.buf.as_ptr(), bits as *mut u8, canvas.buf.len());
-                let old = SelectObject(memdc, dib);
+            // The DIB is made once per layout, not once per frame. Allocating and freeing 600 KB
+            // sixty times a second was pure overhead, and it landed on exactly the frames that were
+            // already doing the most work.
+            if surface.as_ref().map(|s: &Surface| s.w != lay.w || s.h != lay.h).unwrap_or(true) {
+                if let Some(old) = surface.take() {
+                    old.release(memdc);
+                }
+                surface = Surface::new(screen, memdc, lay.w, lay.h);
+            }
+            if let Some(sfc) = surface.as_ref() {
+                std::ptr::copy_nonoverlapping(canvas.buf.as_ptr(), sfc.bits, canvas.buf.len());
                 let blend = BLENDFUNCTION {
                     BlendOp: AC_SRC_OVER as u8,
                     // The fade rides on the layered window's global alpha, so it costs nothing:
@@ -1156,12 +1167,53 @@ fn main() {
                     Some(&blend),
                     ULW_ALPHA,
                 );
-                let _ = SelectObject(memdc, old);
-                let _ = DeleteObject(dib);
             }
 
-            std::thread::sleep(TICK);
+            // Pace on the frame boundary rather than sleeping a fixed tick after the work. A flat
+            // sleep makes the period `work + tick`, so the frames that draw the most — a panel
+            // opening, a swap — are also the slowest to come round, which is what read as a
+            // stutter exactly when something interesting was happening.
+            let spent = frame_start.elapsed();
+            if spent < TICK {
+                std::thread::sleep(TICK - spent);
+            }
         }
+    }
+}
+
+/// The bitmap the layered window is fed. Held across frames: its size only changes when the layout
+/// does.
+struct Surface {
+    dib: HGDIOBJ,
+    prev: HGDIOBJ,
+    bits: *mut u8,
+    w: i32,
+    h: i32,
+}
+
+impl Surface {
+    unsafe fn new(screen: HDC, memdc: HDC, w: i32, h: i32) -> Option<Surface> {
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down, matching the canvas
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        let prev = SelectObject(memdc, dib);
+        Some(Surface { dib: dib.into(), prev, bits: bits as *mut u8, w, h })
+    }
+
+    unsafe fn release(self, memdc: HDC) {
+        let _ = SelectObject(memdc, self.prev);
+        let _ = DeleteObject(self.dib);
     }
 }
 
@@ -1739,6 +1791,34 @@ largura solida (alpha>200) por linha, do topo e da base:");
             let w_top = (0..lay.w).filter(|x| at(*x, (top_edge - d).max(0)).3 > 200).count();
             let w_bot = (0..lay.w).filter(|x| at(*x, (bot_edge + d).min(lay.h - 1)).3 > 200).count();
             println!("  {d:>2}px  topo={w_top:>3}  base={w_bot:>3}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn how_long_a_frame_takes() {
+        // The swap and the close redraw every frame. At 60 fps a frame has 16.7 ms; anything close
+        // to that here is the stutter.
+        let lay = Layout::new(1.2, 2, 0.0);
+        let mut big = reading(Some(0.27), Work::Running);
+        big.rows = (0..3).map(|i| (format!("Limit {i}"), Some(0.3))).collect();
+        big.sessions = vec![("proj".into(), "working".into()), ("outro".into(), "waiting".into())];
+        let readings = vec![("claude", big), ("codex", reading(Some(0.02), Work::Idle))];
+        let lay = Layout::new(1.2, 2, panels_height(&lay, &readings));
+        let mut c = Canvas::new(lay.w, lay.h);
+        let mut marks = Marks::default();
+        let mut font = Text::system().unwrap();
+
+        for (name, card) in [("pill so", 0.0), ("painel aberto", 1.0), ("meio da troca", 0.5)] {
+            let f = Frame { lay: &lay, readings: &readings, cs: 1.0, card, t: 0.3, panel: Some(0) };
+            render(&mut c, &f, &mut marks, &mut font); // aquece os caches
+            let t0 = std::time::Instant::now();
+            const N: u32 = 30;
+            for _ in 0..N {
+                render(&mut c, &f, &mut marks, &mut font);
+            }
+            let per = t0.elapsed().as_secs_f64() * 1000.0 / N as f64;
+            println!("{name:>16}: {per:.2} ms por frame  ({}x{})", lay.w, lay.h);
         }
     }
 

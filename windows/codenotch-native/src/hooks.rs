@@ -8,6 +8,7 @@
 //! events at this port, and reimplementing it would be a good way to lose that.
 
 use crate::state::{HookEvent, Store};
+use crate::usage::UsageSnapshot;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,12 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 pub struct Hub {
     pub store: Mutex<Store>,
+    /// The usage fetcher's working copy. It persists to `usage.json` on every change, which is
+    /// what the pill actually reads, so this is the fetcher's own state rather than a second
+    /// source of truth.
+    pub usage: Mutex<UsageSnapshot>,
+    /// The same for Codex, which shares the snapshot shape.
+    pub codex: Mutex<UsageSnapshot>,
     changed: AtomicBool,
 }
 
