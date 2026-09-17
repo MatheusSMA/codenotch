@@ -50,7 +50,9 @@ impl Canvas {
     }
 
     /// Filled rounded rectangle with a 1 px anti-aliased edge, plus an optional hairline stroke.
-    pub fn round_rect(&mut self, cx: f32, cy: f32, hw: f32, hh: f32, r: f32, rgb: [f32; 3], stroke: Option<[f32; 3]>) {
+    /// `alpha` multiplies the whole shape, so a panel and everything drawn into it can fade
+    /// together instead of the contents arriving first.
+    pub fn round_rect(&mut self, cx: f32, cy: f32, hw: f32, hh: f32, r: f32, rgb: [f32; 3], stroke: Option<[f32; 3]>, alpha: f32) {
         let x0 = (cx - hw - 2.0).floor().max(0.0) as i32;
         let x1 = (cx + hw + 2.0).ceil().min(self.w as f32) as i32;
         let y0 = (cy - hh - 2.0).floor().max(0.0) as i32;
@@ -60,9 +62,9 @@ impl Canvas {
                 let px = x as f32 + 0.5 - cx;
                 let py = y as f32 + 0.5 - cy;
                 let d = sd_round_rect(px, py, hw, hh, r);
-                self.put(x, y, rgb, 1.0 - smoothstep(-0.5, 0.5, d));
+                self.put(x, y, rgb, (1.0 - smoothstep(-0.5, 0.5, d)) * alpha);
                 if let Some(s) = stroke {
-                    let edge = (1.0 - smoothstep(0.0, 1.2, (d + 0.6).abs())) * 0.8;
+                    let edge = (1.0 - smoothstep(0.0, 1.2, (d + 0.6).abs())) * 0.8 * alpha;
                     self.put(x, y, s, edge);
                 }
             }
@@ -120,18 +122,35 @@ impl Canvas {
         // and inset by r from the screen edge.
         let ccx = right - r;
         let ccy = if above { edge_y - r } else { edge_y + r };
-        let (y0, y1) = if above { (edge_y - r, edge_y) } else { (edge_y, edge_y + r) };
+        // Overlapping the panel's own edge by a pixel, not stopping at it. The panel draws a
+        // hairline all the way round, including along the edge the fillet joins, and leaving that
+        // line exposed puts a visible rule across the join. notch.html solves it the same way:
+        // "covers the 1 px stroke along the pill's top edge so there is no seam".
+        const OVERLAP: f32 = 1.5;
+        let (y0, y1) = if above {
+            (edge_y - r, edge_y + OVERLAP)
+        } else {
+            (edge_y - OVERLAP, edge_y + r)
+        };
         let x0 = ccx.floor().max(0.0) as i32;
         let x1 = right.ceil().min(self.w as f32) as i32;
         let y0i = y0.floor().max(0.0) as i32;
         let y1i = y1.ceil().min(self.h as f32) as i32;
         for y in y0i..y1i {
             for x in x0..x1 {
-                let d = (x as f32 + 0.5 - ccx).hypot(y as f32 + 0.5 - ccy);
-                // Outside the circle is solid; the transition is the panel's own hairline.
-                self.put(x, y, rgb, smoothstep(r - 0.5, r + 0.5, d));
-                let seam = 1.0 - smoothstep(0.0, 1.2, (d - r).abs());
-                self.put(x, y, stroke, seam * 0.8);
+                let py = y as f32 + 0.5;
+                let d = (x as f32 + 0.5 - ccx).hypot(py - ccy);
+                // Past the panel's edge, inside the overlap, the fill is unconditional: that strip
+                // exists to bury the hairline, not to be shaped by the arc.
+                let past_edge = if above { py > edge_y } else { py < edge_y };
+                let cover = if past_edge { 1.0 } else { smoothstep(r - 0.5, r + 0.5, d) };
+                self.put(x, y, rgb, cover);
+                // The arc carries the panel's outline onward, so the shape keeps its edge against a
+                // dark wallpaper. Only along the curve itself, never across the overlap strip.
+                if !past_edge {
+                    let seam = 1.0 - smoothstep(0.0, 1.0, (d - r).abs());
+                    self.put(x, y, stroke, seam * 0.55);
+                }
             }
         }
     }

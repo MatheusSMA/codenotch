@@ -58,8 +58,6 @@ const CARD_W: f32 = 320.0;
 const CARD_GAP: f32 = 12.0;
 const CARD_PAD: f32 = 18.0;
 const CARD_RADIUS: f32 = 16.0;
-/// Space between one provider's panel and the next.
-const CARD_STACK_GAP: f32 = 10.0;
 const TITLE_PX: f32 = 16.0;
 const ROW_PX: f32 = 13.0;
 const TITLE_GAP: f32 = 12.0;
@@ -428,11 +426,40 @@ impl Layout {
             w: (w * scale).round() as i32,
             h: h.round() as i32,
             pill_left: (CARD_W + CARD_GAP) * scale,
+            // Both rounded. With a fractional height the top edge lands on one subpixel phase and
+            // the bottom on another, and the two fillets come out visibly different shapes.
             pill_top: ((h - pill_h) / 2.0).round(),
-            pill_h,
+            pill_h: pill_h.round(),
             cell_h,
             pct_px: (PCT_PX * scale).max(6.0),
         }
+    }
+}
+
+impl Layout {
+    /// Which ring the pointer is over, given a y in window coordinates. The rows are the pill's
+    /// own cells, so a click lands on the provider it looks like it landed on.
+    fn cell_at(&self, y: f32, cells: usize) -> Option<usize> {
+        let step = (self.cell_h + GAP) * self.scale;
+        let first = self.pill_top + PAD_Y * self.scale;
+        if y < first {
+            return None;
+        }
+        let i = ((y - first) / step).floor() as usize;
+        // The gap between two cells belongs to neither, or a click between rings would open one
+        // of them at random.
+        let within = (y - first) - i as f32 * step;
+        (i < cells && within <= self.cell_h * self.scale).then_some(i)
+    }
+}
+
+/// What a click on ring `hit` does to the open panel. Clicking the open ring shuts it, a different
+/// ring swaps to that one, and a click that landed between rings leaves things as they were.
+fn next_panel(current: Option<usize>, hit: Option<usize>) -> Option<usize> {
+    match (current, hit) {
+        (Some(open), Some(i)) if open == i => None,
+        (_, Some(i)) => Some(i),
+        (open, None) => open,
     }
 }
 
@@ -450,8 +477,10 @@ struct Frame<'a> {
     readings: &'a [(&'a str, Reading)],
     /// Content scale, 0.93 to 1.0, riding the reveal spring.
     cs: f32,
-    /// How open the detail card is, 0 to 1.
+    /// How open the detail panel is, 0 to 1.
     card: f32,
+    /// Which provider's panel it is. One at a time: the panel belongs to the ring you clicked.
+    panel: Option<usize>,
     /// Seconds since start, for the working arc.
     t: f32,
 }
@@ -478,6 +507,7 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
         RADIUS * s,
         PILL_BG,
         Some(PILL_EDGE),
+        1.0,
     );
 
     // The fillets: concave quarter-arcs joining the pill to the screen edge above and below, so the
@@ -542,20 +572,19 @@ fn panel_height(lay: &Layout, r: &Reading) -> f32 {
     h
 }
 
-/// The whole stack, so the window can be made tall enough before anything is drawn.
+/// The tallest a single panel can get, so the window is big enough whichever ring is clicked.
+/// Only one is ever shown, so this is a maximum rather than a sum.
 fn panels_height(lay: &Layout, readings: &[(&str, Reading)]) -> f32 {
-    if readings.is_empty() {
-        return 0.0;
-    }
-    let gaps = (readings.len() - 1) as f32 * CARD_STACK_GAP * lay.scale;
-    readings.iter().map(|(_, r)| panel_height(lay, r)).sum::<f32>() + gaps
+    readings.iter().map(|(_, r)| panel_height(lay, r)).fold(0.0, f32::max)
 }
 
 /// A usage bar: a dark track with the used fraction filled in its band colour. Reads at a glance,
 /// which a percentage does not — 47 % means nothing until you recall what the limit was.
 fn draw_bar(c: &mut Canvas, left: f32, top: f32, w: f32, h: f32, used: Option<f32>, a: f32) {
     let r = h / 2.0;
-    c.round_rect(left + w / 2.0, top + r, w / 2.0, r, r, TRACK, None);
+    // `a` is the panel's fade. It used to be ignored here, so while the panel faded in the bars
+    // were already at full strength — they arrived before the box around them.
+    c.round_rect(left + w / 2.0, top + r, w / 2.0, r, r, TRACK, None, a);
     let Some(u) = used else { return };
     let frac = u.clamp(0.0, 1.0);
     if frac <= 0.0 {
@@ -563,23 +592,26 @@ fn draw_bar(c: &mut Canvas, left: f32, top: f32, w: f32, h: f32, used: Option<f3
     }
     // Never thinner than its own cap, or a reading of 1 % draws a wedge instead of a dot.
     let fill = (w * frac).max(h);
-    c.round_rect(left + fill / 2.0, top + r, fill / 2.0, r, r, band(u), None);
-    let _ = a;
+    c.round_rect(left + fill / 2.0, top + r, fill / 2.0, r, r, band(u), None, a);
 }
 
-/// One panel per provider, stacked and centred beside the pill.
+/// The panel of whichever ring was clicked. One at a time: two panels side by side turned the
+/// glance into a search, and a provider's detail belongs to that provider's ring.
 fn draw_panels(c: &mut Canvas, f: &Frame, font: &mut Text) {
     let (lay, s) = (f.lay, f.lay.scale);
+    let Some(idx) = f.panel else { return };
+    let Some((provider, r)) = f.readings.get(idx) else { return };
     let w = CARD_W * s;
-    // The stack slides the last few pixels in as it fades, so it arrives rather than blinking on.
+    // It slides the last few pixels in as it fades, so it arrives rather than blinking on.
     let left = lay.pill_left - CARD_GAP * s - w + (1.0 - f.card) * 12.0 * s;
     let a = f.card;
-    let total = panels_height(lay, f.readings);
-    let mut top = (lay.h as f32 - total) / 2.0;
 
-    for (provider, r) in f.readings {
+    {
         let h = panel_height(lay, r);
-        c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, Some(PILL_EDGE));
+        // Centred on its own ring rather than on the window: the panel points at what opened it.
+        let ring_mid = lay.pill_top + PAD_Y * s + idx as f32 * (lay.cell_h + GAP) * s + RING_BOX / 2.0 * s;
+        let top = (ring_mid - h / 2.0).clamp(0.0, (lay.h as f32 - h).max(0.0));
+        c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, Some(PILL_EDGE), a);
 
         let text_left = left + CARD_PAD * s;
         let text_right = left + w - CARD_PAD * s;
@@ -640,7 +672,6 @@ fn draw_panels(c: &mut Canvas, f: &Frame, font: &mut Text) {
             }
         }
 
-        top += h + CARD_STACK_GAP * s;
     }
 }
 
@@ -796,7 +827,8 @@ fn main() {
         let mut open = Spring::new(0.0, REVEAL_RESPONSE, REVEAL_DAMPING);
         let mut card = Spring::new(0.0, REVEAL_RESPONSE, DISMISS_DAMPING);
         let mut shown = false;
-        let mut card_open = false;
+        // Which ring's panel is out, if any.
+        let mut card_open: Option<usize> = None;
         let mut was_down = false;
         // When the pointer first went outside, or None while it is inside.
         let mut left_at: Option<Instant> = None;
@@ -879,7 +911,7 @@ fn main() {
             // position shrinks the hot area to the edge strip for as long as the pill is still on
             // its way out, so a pointer that drifts twenty pixels mid-slide sends it back.
             let edge_strip = hidden_x as f32 - 2.0;
-            let settled_left = shown_x as f32 + if card_open { 0.0 } else { lay.pill_left };
+            let settled_left = shown_x as f32 + if card_open.is_some() { 0.0 } else { lay.pill_left };
             let hot_left = settled_left.min(edge_strip);
             // Asymmetric on purpose: harder to leave than to arrive. The boundary to cross going
             // out sits further in than the one coming back, so a hand that is not perfectly still
@@ -913,7 +945,11 @@ fn main() {
             let down = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0;
             let over_pill = in_rows && (cur.x as f32) >= pos + lay.pill_left;
             if down && !was_down && over_pill && shown {
-                card_open = !card_open;
+                // Which ring was hit decides which panel opens; clicking the open one shuts it,
+                // and clicking a different ring swaps rather than stacking a second panel.
+                let hit = lay.cell_at(cur.y as f32 - y as f32, readings.len());
+                card_open = next_panel(card_open, hit);
+                trace(&format!("click cell={hit:?} panel={card_open:?}"));
             }
             was_down = down;
 
@@ -929,9 +965,9 @@ fn main() {
                 open.response = if shown { REVEAL_RESPONSE } else { DISMISS_RESPONSE };
                 open.damping = if shown { REVEAL_DAMPING } else { DISMISS_DAMPING };
             }
-            // Leaving closes the card too: it must not be left hanging open off the edge.
-            if !shown && card_open {
-                card_open = false;
+            // Leaving closes the panel too: it must not be left hanging open off the edge.
+            if !shown && card_open.is_some() {
+                card_open = None;
             }
 
             // Solid only where something is drawn, so clicks elsewhere reach the desktop.
@@ -946,7 +982,7 @@ fn main() {
             last_frame = now;
 
             let open_target = if shown { 1.0 } else { 0.0 };
-            let card_target = if card_open { 1.0 } else { 0.0 };
+            let card_target = if card_open.is_some() { 1.0 } else { 0.0 };
             if !open.settled(open_target) {
                 open.step(open_target, dt);
             }
@@ -955,7 +991,14 @@ fn main() {
             }
 
             let (next_alpha, next_scale) = skin(open.value);
-            let next_pos = hidden_x as f32 + (shown_x - hidden_x) as f32 * open.value;
+            // Clamped at the settled position. The spring overshoots by design, but `shown_x` is
+            // already where the window's right edge meets the screen's: going past it pulls the
+            // pill away from the edge and shows the side of it that is meant to be off-screen.
+            // The bounce is not lost, it just lives in the content scale, which overshoots too —
+            // a thing that hits a wall stops, and what is inside it keeps going for a moment.
+            let next_pos = (hidden_x as f32 + (shown_x - hidden_x) as f32 * open.value)
+                .max(shown_x as f32)
+                .min(hidden_x as f32);
             let next_card = card.value.clamp(0.0, 1.0);
             let animating_ring = open.value > 0.02
                 && readings.iter().any(|(_, r)| matches!(r.work, Work::Running | Work::Attention));
@@ -974,6 +1017,7 @@ fn main() {
                         readings: &readings,
                         cs: next_scale,
                         card: next_card,
+                        panel: card_open,
                         t: start.elapsed().as_secs_f32(),
                     },
                     &mut marks,
@@ -1174,18 +1218,45 @@ mod tests {
     }
 
     #[test]
-    fn each_provider_gets_its_own_panel() {
-        // One box per provider, not one box with blocks inside: the stack is the sum of the panels
-        // plus the gaps between them.
+    fn the_window_fits_the_tallest_panel_not_all_of_them() {
+        // Only one panel is ever out, so the window has to cover the largest rather than the sum.
         let lay = Layout::new(1.0, 2, 0.0);
-        let r = || reading(Some(0.2), Work::Idle);
-        let one = [("claude", r())];
-        let two = [("claude", r()), ("codex", r())];
-        let stacked = panels_height(&lay, &two);
-        assert!(
-            stacked >= panels_height(&lay, &one) * 2.0 + CARD_STACK_GAP,
-            "two panels should be two panels plus a gap, got {stacked}"
-        );
+        let small = reading(Some(0.2), Work::Idle);
+        let mut big = reading(Some(0.2), Work::Running);
+        big.sessions = vec![("a".into(), "x".into()), ("b".into(), "y".into())];
+        let both = [("claude", big), ("codex", small)];
+        let need = panels_height(&lay, &both);
+        assert_eq!(need, panel_height(&lay, &both[0].1), "the tallest one decides");
+        assert!(need < panel_height(&lay, &both[0].1) + panel_height(&lay, &both[1].1));
+    }
+
+    #[test]
+    fn a_click_opens_the_ring_it_landed_on() {
+        assert_eq!(next_panel(None, Some(1)), Some(1));
+        assert_eq!(next_panel(Some(0), Some(1)), Some(1), "a different ring swaps");
+    }
+
+    #[test]
+    fn clicking_the_open_ring_shuts_it() {
+        assert_eq!(next_panel(Some(1), Some(1)), None);
+    }
+
+    #[test]
+    fn a_click_between_rings_changes_nothing() {
+        // The gap belongs to neither ring; treating it as a hit would open one at random.
+        assert_eq!(next_panel(Some(1), None), Some(1));
+        assert_eq!(next_panel(None, None), None);
+    }
+
+    #[test]
+    fn the_rings_map_to_the_cells_under_them() {
+        let lay = Layout::new(1.0, 2, 0.0);
+        let first = lay.pill_top + PAD_Y;
+        assert_eq!(lay.cell_at(first + 1.0, 2), Some(0));
+        assert_eq!(lay.cell_at(first + lay.cell_h + GAP + 1.0, 2), Some(1));
+        assert_eq!(lay.cell_at(first - 5.0, 2), None, "above the first ring");
+        assert_eq!(lay.cell_at(first + lay.cell_h + 2.0, 2), None, "in the gap between them");
+        assert_eq!(lay.cell_at(first + (lay.cell_h + GAP) * 5.0, 2), None, "past the last ring");
     }
 
     #[test]
@@ -1345,6 +1416,25 @@ mod tests {
     }
 
     #[test]
+    fn the_overshoot_never_pulls_the_pill_off_the_screen_edge() {
+        // The spring peaks above 1.0 on purpose, but the window is flush with the screen edge at
+        // its settled position: any further and the right side of the pill, which is supposed to be
+        // off-screen, comes into view with desktop behind it.
+        let (hidden_x, shown_x) = (3433.0, 2953.0);
+        let place = |v: f32| (hidden_x + (shown_x - hidden_x) * v).max(shown_x).min(hidden_x);
+        let peak = run(0.0, 1.0, REVEAL_RESPONSE, REVEAL_DAMPING)
+            .iter()
+            .copied()
+            .fold(f32::MIN, f32::max);
+        assert!(peak > 1.0, "the spring should still overshoot: {peak}");
+        assert_eq!(place(peak), shown_x, "but the window must stop at the edge");
+        for v in [-0.2, 0.0, 0.5, 1.0, 1.2] {
+            let p = place(v);
+            assert!((shown_x..=hidden_x).contains(&p), "position left its track at {v}: {p}");
+        }
+    }
+
+    #[test]
     fn a_pointer_well_clear_of_the_edge_is_not_hot() {
         let (pill_left, hidden_x, shown_x) = (310.0, 3433.0, 3042.0);
         assert!(2000.0 < hot_left(shown_x, pill_left, hidden_x, false), "the desktop should be cold");
@@ -1364,7 +1454,7 @@ mod tests {
 
     fn paint(lay: &Layout, readings: &[(&str, Reading)], card: f32, t: f32) -> Canvas {
         let mut c = Canvas::new(lay.w, lay.h);
-        let f = Frame { lay, readings, cs: 1.0, card, t };
+        let f = Frame { lay, readings, cs: 1.0, card, t, panel: Some(0) };
         render(&mut c, &f, &mut Marks::default(), &mut Text::system().unwrap());
         c
     }
