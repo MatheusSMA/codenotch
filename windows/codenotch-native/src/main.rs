@@ -126,6 +126,17 @@ const DISMISS_BOUNCE: f32 = 0.04; // all but critically damped: no wobble on the
 /// The panel's own box closes slower still, and without any bounce. It is the thing being read, so
 /// it is the last to go and the calmest about it.
 const PANEL_CLOSE_DURATION: f32 = 1.1;
+/// Closing on the way to another panel is a different move from closing for good. Nobody is waiting
+/// on a dismissal, but during a swap the next panel is what you asked for, so the shut half has to
+/// get out of the way.
+const PANEL_SWAP_DURATION: f32 = 0.3;
+/// The panel is considered gone at this much rather than at nothing. A spring approaches zero
+/// exponentially, so the last sliver costs more time than all the rest of the close — and that
+/// sliver is what read as the swap hanging just before the other panel arrived.
+const PANEL_GONE: f32 = 0.06;
+/// How much of its speed the panel keeps through a swap. Zeroing it made the next panel start from
+/// a standstill, which broke one movement into two.
+const SWAP_CARRY: f32 = 0.55;
 /// While a panel is still on screen the pill stays out, however the pointer left. The panel is
 /// drawn inside the window, so retracting first does not animate it away — it drags it off the
 /// edge, and what the eye sees is the panel being cut rather than closing.
@@ -1070,13 +1081,24 @@ fn main() {
             // The panel closes before it swaps: the box shrinks away, the contents change at the
             // bottom of that dip, and it opens again. Changing them mid-flight would be a cut.
             let card_to = card_target(panel_shown, panel_want);
-            card.duration = if card_to > 0.5 { REVEAL_DURATION } else { PANEL_CLOSE_DURATION };
+            // Three cases, not two: opening, closing for good, and closing on the way to another
+            // panel. The last one used to borrow the dismissal's timing and spent a second closing
+            // something the user had already asked to replace.
+            let swapping = panel_shown != panel_want && panel_want.is_some();
+            card.duration = match (card_to > 0.5, swapping) {
+                (true, _) => REVEAL_DURATION,
+                (false, true) => PANEL_SWAP_DURATION,
+                (false, false) => PANEL_CLOSE_DURATION,
+            };
             if !card.settled(card_to) {
                 card.step(card_to, dt);
             }
-            if card.value < 0.02 && panel_shown != panel_want {
+            if card.value < PANEL_GONE && panel_shown != panel_want {
                 panel_shown = panel_want;
-                card.vel = 0.0;
+                // Turn the speed around instead of discarding it. The panel is still moving when
+                // the contents change, so the swap reads as one gesture that bounces off the
+                // bottom rather than two that meet at a standstill.
+                card.vel = -card.vel * SWAP_CARRY;
             }
 
             // The pill waits for the panel to finish leaving before it retracts, or the panel goes
@@ -1411,6 +1433,37 @@ mod tests {
         // The lead shrinks as the list grows, or the last row of a long one would still be sliding
         // in after the box around it had settled.
         assert!((stagger(1.0, 19, 20) - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_swap_is_quicker_than_a_dismissal() {
+        // Closing for good has nobody waiting on it. Closing to make room for the panel that was
+        // just asked for does, and it used to borrow the dismissal's second-long timing.
+        assert!(PANEL_SWAP_DURATION < PANEL_CLOSE_DURATION);
+        assert!(PANEL_SWAP_DURATION <= REVEAL_DURATION, "the shut half should not outlast the open");
+    }
+
+    #[test]
+    fn the_swap_point_is_not_the_bottom_of_the_tail() {
+        // A spring approaches zero exponentially: waiting for it to reach nothing spends more time
+        // on the last invisible sliver than on the whole visible close.
+        let closing = run(1.0, 0.0, PANEL_SWAP_DURATION, 0.0);
+        let to_gone = closing.iter().take_while(|v| **v >= PANEL_GONE).count();
+        let to_nothing = closing.len();
+        assert!(PANEL_GONE > 0.0 && PANEL_GONE < 0.15, "and it still has to look gone");
+        assert!(
+            (to_nothing - to_gone) * 3 > to_nothing,
+            "the tail should be worth skipping: {to_gone} frames to fade, {to_nothing} to settle"
+        );
+    }
+
+    #[test]
+    fn the_swap_keeps_some_of_its_speed() {
+        // Reflected, not discarded: the panel is still moving when its contents change.
+        let incoming = -2.0f32;
+        let after = -incoming * SWAP_CARRY;
+        assert!(after > 0.0, "it should be heading back out");
+        assert!(after < -incoming, "but not gain energy from the turn");
     }
 
     #[test]
