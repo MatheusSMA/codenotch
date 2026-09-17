@@ -114,8 +114,14 @@ fn trace(line: &str) {
 // the part nobody enjoys.
 const REVEAL_RESPONSE: f32 = 0.34; // seconds for one oscillation
 const REVEAL_DAMPING: f32 = 0.72; // below 1.0, so it passes the target once
-const DISMISS_RESPONSE: f32 = 0.34;
-const DISMISS_DAMPING: f32 = 1.0; // critically damped: straight home, no bounce
+// Leaving is the longer of the two now. Critical damping spends most of the distance in the first
+// few frames and then creeps, which reads as being snatched away even when the total time is not
+// short; easing off the damping trades that for a visible deceleration.
+const DISMISS_RESPONSE: f32 = 0.62;
+const DISMISS_DAMPING: f32 = 0.92;
+/// The panel's own box closes slower still. It is the thing being read, so it should be the last
+/// thing to go.
+const PANEL_CLOSE_RESPONSE: f32 = 0.70;
 /// While a panel is still on screen the pill stays out, however the pointer left. The panel is
 /// drawn inside the window, so retracting first does not animate it away — it drags it off the
 /// edge, and what the eye sees is the panel being cut rather than closing.
@@ -389,12 +395,16 @@ fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
-/// Opacity and content scale, both read off how open the pill is. The fade is deliberately ahead of
-/// the movement: at a third of the way out the pill is already almost fully solid. Matching opacity
-/// to position one-for-one makes an entrance feel like it is dragging something heavy.
-fn skin(openness: f32) -> (f32, f32) {
+/// Opacity and content scale, both read off how open the pill is.
+///
+/// The fade runs ahead of the movement on the way in: at a third of the way out the pill is already
+/// almost solid, because matching opacity to position one-for-one makes an entrance feel like it is
+/// dragging something heavy. On the way out that same curve is wrong — it holds full opacity for
+/// most of the trip and then drops all at once, which is the part that reads as being snatched
+/// away. Leaving fades evenly instead, so the pill is still visible while it travels.
+fn skin(openness: f32, leaving: bool) -> (f32, f32) {
     let o = openness.clamp(0.0, 1.5);
-    let fade = (o * 1.7).clamp(0.0, 1.0);
+    let fade = if leaving { o.min(1.0) } else { (o * 1.7).clamp(0.0, 1.0) };
     let alpha = HIDDEN_ALPHA + (1.0 - HIDDEN_ALPHA) * ease_out(fade);
     let scale = CONTENT_MIN_SCALE + (1.0 - CONTENT_MIN_SCALE) * o.min(1.06);
     (alpha, scale)
@@ -1018,6 +1028,7 @@ fn main() {
             // The panel closes before it swaps: the box shrinks away, the contents change at the
             // bottom of that dip, and it opens again. Changing them mid-flight would be a cut.
             let card_to = card_target(panel_shown, panel_want);
+            card.response = if card_to > 0.5 { REVEAL_RESPONSE } else { PANEL_CLOSE_RESPONSE };
             if !card.settled(card_to) {
                 card.step(card_to, dt);
             }
@@ -1029,11 +1040,13 @@ fn main() {
             // The pill waits for the panel to finish leaving before it retracts, or the panel goes
             // out of the frame instead of out of the way.
             let open_target = pill_target(shown, card.value);
+            open.response = if open_target > 0.5 { REVEAL_RESPONSE } else { DISMISS_RESPONSE };
+            open.damping = if open_target > 0.5 { REVEAL_DAMPING } else { DISMISS_DAMPING };
             if !open.settled(open_target) {
                 open.step(open_target, dt);
             }
 
-            let (next_alpha, next_scale) = skin(open.value);
+            let (next_alpha, next_scale) = skin(open.value, open_target < 0.5);
             // Clamped at the settled position. The spring overshoots by design, but `shown_x` is
             // already where the window's right edge meets the screen's: going past it pulls the
             // pill away from the edge and shows the side of it that is meant to be off-screen.
@@ -1304,14 +1317,48 @@ mod tests {
     }
 
     #[test]
-    fn leaving_is_no_longer_quicker_than_arriving_by_much() {
-        // It used to snap away. Still shorter than the entrance — waiting for something to finish
-        // disappearing is nobody's favourite — but no longer a third of it.
-        assert!(DISMISS_RESPONSE <= REVEAL_RESPONSE, "leaving should not outlast arriving");
-        assert!(
-            DISMISS_RESPONSE >= REVEAL_RESPONSE * 0.75,
-            "and should not be a snap either: {DISMISS_RESPONSE} against {REVEAL_RESPONSE}"
-        );
+    fn leaving_is_unhurried() {
+        // Twice it came back as still too fast. Leaving is now the longer of the two, and the
+        // panel's own box is longer again — it is the thing being read, so it goes last.
+        assert!(DISMISS_RESPONSE > REVEAL_RESPONSE, "leaving should outlast arriving");
+        assert!(PANEL_CLOSE_RESPONSE >= DISMISS_RESPONSE, "the panel should be the last to go");
+    }
+
+    /// Frames until the spring has covered all but the last 5 %, at 60 fps. The rest is sub-pixel
+    /// creep that nobody sees, so this — not the time to settle — is how long the move looks.
+    fn visible_frames(response: f32, damping: f32) -> usize {
+        run(1.0, 0.0, response, damping).iter().take_while(|v| **v > 0.05).count()
+    }
+
+    #[test]
+    fn the_exit_takes_long_enough_to_read_as_a_departure() {
+        // Twice reported as still too quick. Measuring the wrong thing cost a round: a spring
+        // released from rest always covers most of its distance early — the force is largest at
+        // the largest displacement — so "distance in the first quarter of the frames" says nothing
+        // about how rushed it looks, and no damping value changes it. What matters is how long the
+        // part you can actually see lasts.
+        let frames = visible_frames(DISMISS_RESPONSE, DISMISS_DAMPING);
+        let seconds = frames as f32 / 60.0;
+        assert!(seconds > 0.35, "the exit is over in {seconds:.2}s, which reads as a snap");
+        assert!(seconds < 0.9, "and this long starts to feel like waiting: {seconds:.2}s");
+    }
+
+    #[test]
+    fn the_panel_outlasts_the_pill_on_the_way_out() {
+        assert!(visible_frames(PANEL_CLOSE_RESPONSE, DISMISS_DAMPING) >= visible_frames(DISMISS_RESPONSE, DISMISS_DAMPING));
+    }
+
+    #[test]
+    fn the_fade_holds_on_the_way_out() {
+        // The entrance is deliberately opaque early. Reusing that curve on the exit kept the pill
+        // solid for most of the trip and then dropped it all at once, which is the part that read
+        // as a snap rather than a departure.
+        let half_in = skin(0.5, false).0;
+        let half_out = skin(0.5, true).0;
+        assert!(half_in > half_out, "entering should be more solid at the half-way point");
+
+        // And on the way out it should still be clearly visible most of the way.
+        assert!(skin(0.5, true).0 > HIDDEN_ALPHA + (1.0 - HIDDEN_ALPHA) * 0.5);
     }
 
     #[test]
@@ -1430,10 +1477,10 @@ mod tests {
 
     #[test]
     fn opacity_leads_the_movement_and_stays_in_range() {
-        let (a_third, _) = skin(0.33);
+        let (a_third, _) = skin(0.33, false);
         assert!(a_third > 0.85, "a third of the way out it should be nearly solid, got {a_third}");
         for i in 0..=150 {
-            let (a, sc) = skin(i as f32 / 100.0);
+            let (a, sc) = skin(i as f32 / 100.0, false);
             assert!((HIDDEN_ALPHA..=1.0).contains(&a), "opacity left its range: {a}");
             assert!((CONTENT_MIN_SCALE..=1.01).contains(&sc), "scale left its range: {sc}");
         }
@@ -1441,8 +1488,8 @@ mod tests {
 
     #[test]
     fn content_starts_small_and_ends_full_size() {
-        assert!((skin(0.0).1 - CONTENT_MIN_SCALE).abs() < 1e-3);
-        assert!((skin(1.0).1 - 1.0).abs() < 0.01);
+        assert!((skin(0.0, false).1 - CONTENT_MIN_SCALE).abs() < 1e-3);
+        assert!((skin(1.0, false).1 - 1.0).abs() < 0.01);
     }
 
     // ------------------------------------------------------------ hover
