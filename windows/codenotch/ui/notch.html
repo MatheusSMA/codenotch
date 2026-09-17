@@ -56,12 +56,17 @@
   /* Session arc animation */
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-  /* A 60 fps SVG transform animation in a transparent always-on-top window slows the whole desktop
-     compositor (other apps stutter). steps() drops repaints to ~10 fps; it still reads as spinning/breathing. */
-  .arc-spin{animation:spin 1.2s steps(12) infinite;transform-origin:center}
-  .arc-pulse{animation:pulse 1.1s steps(6) infinite}
+  /* The working indicator lives in its own div (.spin), not as a <g> inside svg.ring. A CSS
+     transform on an SVG child cannot be promoted to a compositor layer, so every frame
+     re-rasterised the whole ring on the main thread — which is why this had to be capped to
+     ~10 fps. On its own layer the compositor turns it between frames: smooth, and cheaper than
+     the stepped version was. */
+  .ringwrap > .spin{position:absolute;inset:0;overflow:visible;pointer-events:none}
+  .ringwrap > .spin > svg{position:absolute;inset:0;overflow:visible}
+  .spin.run{will-change:transform;transform-origin:center;animation:spin 1.2s linear infinite}
+  .spin.wait{will-change:opacity;animation:pulse 1.1s ease-in-out infinite}
   /* Windows' Animation effects switch: a still arc and a solid ring, as on the Mac under Reduce Motion */
-  @media (prefers-reduced-motion: reduce){.arc-spin,.arc-pulse{animation:none}}
+  @media (prefers-reduced-motion: reduce){.spin.run,.spin.wait{animation:none}}
 
   /* Hover card, shown to the left of the pill */
   #card{
@@ -459,9 +464,20 @@ function renderRing(){
       }
     }
     { // thin inner arc: spinning white = working, yellow pulse = waiting on you (one animation for all four, different sources)
+      // Outside svg.ring and outside the innerHTML rebuild below: re-creating the element restarted
+      // the animation from 0deg on every render, which read as a stutter. Touched only when the
+      // working state actually changes, so a running arc turns uninterrupted.
       const ws=workState(p.id);
-      if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,INK,2.5)}</g>`;
-      else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${WATCH}" stroke-width="2.5"/></g>`;
+      if(wrap.dataset.ws!==ws){
+        wrap.dataset.ws=ws;
+        let sp=wrap.querySelector('.spin');
+        if(ws==='running'||ws==='attention'){
+          if(!sp){ sp=document.createElement('div'); sp.className='spin'; wrap.insertBefore(sp,wrap.querySelector('.glyph')); }
+          sp.innerHTML=`<svg viewBox="0 0 56 56">${ws==='running'?svgArc(19,0.28,INK,2.5):`<circle cx="28" cy="28" r="19" fill="none" stroke="${WATCH}" stroke-width="2.5"/>`}</svg>`;
+          sp.classList.toggle('run',ws==='running');
+          sp.classList.toggle('wait',ws==='attention');
+        } else if(sp) sp.remove();
+      }
     }
     svg.innerHTML=inner;
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
