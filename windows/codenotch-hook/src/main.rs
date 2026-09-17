@@ -77,10 +77,15 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
 fn spawn_main() {
     let Ok(me) = std::env::current_exe() else { return };
     let Some(dir) = me.parent() else { return };
-    let exe = dir.join("codenotch.exe");
-    if !exe.exists() {
+    // The native build ships beside this helper under its own name; the Tauri one is still
+    // accepted so the same hook keeps working for either.
+    let Some(exe) = ["codenotch-native.exe", "codenotch.exe"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+    else {
         return;
-    }
+    };
     let mut cmd = std::process::Command::new(exe);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

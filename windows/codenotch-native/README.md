@@ -51,6 +51,23 @@ cai para inferir "trabalhando" dos transcripts — so nao consegue mostrar ambar
 engana: ela e per-monitor DPI aware e a maioria das ferramentas nao e, entao um
 cursor lido de outro processo nao concorda com o que ela ve.
 
+## Instalado nesta maquina
+
+Os dois binarios ficam em `%LOCALAPPDATA%\CodenotchNative\`, nao em `target/release`
+— aquilo e pasta de build e um `cargo clean` levaria o exe junto com o atalho de
+inicializacao que aponta para ele.
+
+Para publicar uma versao nova depois de mexer no codigo:
+
+```
+cargo build --release -p codenotch-native -p codenotch-hook
+taskkill /IM codenotch-native.exe /F
+copy /Y targetelease\codenotch-native.exe %LOCALAPPDATA%\CodenotchNativecopy /Y targetelease\codenotch-hook.exe   %LOCALAPPDATA%\CodenotchNativestart "" %LOCALAPPDATA%\CodenotchNative\codenotch-native.exe
+```
+
+O atalho de inicio automatico vive em
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\codenotch-native.lnk`.
+
 ## Rodar
 
 ```

@@ -15,6 +15,7 @@ mod activity;
 mod codex;
 mod glyphs;
 mod hooks;
+mod hooks_install;
 mod paint;
 mod state;
 mod text;
@@ -866,6 +867,15 @@ fn main() {
         // it keeps working, it just cannot show amber.
         let hub = Arc::new(Hub::default());
         let owns_hooks = hooks::start(hub.clone(), HOOK_PORT);
+        // Wire Claude Code's hooks at startup if they are not already pointing here. Without them
+        // nothing posts to the port above, and `attention` can never fire: it is the one state with
+        // no signature on disk. Installing is idempotent and backs the settings file up first.
+        if owns_hooks && !hooks_install::is_installed() {
+            match hooks_install::install() {
+                Ok(msg) => trace(&format!("hooks installed: {msg}")),
+                Err(e) => trace(&format!("hooks not installed: {e}")),
+            }
+        }
         // The usage fetcher. It persists usage.json, which is what the pill reads, so taking the
         // port stops meaning frozen numbers: this binary now refreshes them itself.
         hub.usage.lock().map(|mut u| *u = usage::load_persisted()).ok();
