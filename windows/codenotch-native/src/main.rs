@@ -56,6 +56,10 @@ const FILLET: f32 = 26.0;
 // for reading.
 const CARD_W: f32 = 320.0;
 const CARD_GAP: f32 = 12.0;
+/// Breathing room to the left of the panel. Without it the window was exactly wide enough for
+/// panel + gap + pill, so the panel started at x=0 and its own rounded corner and hairline were
+/// clipped off by the edge of the canvas.
+const CARD_MARGIN: f32 = 10.0;
 const CARD_PAD: f32 = 18.0;
 const CARD_RADIUS: f32 = 16.0;
 const TITLE_PX: f32 = 16.0;
@@ -420,12 +424,12 @@ impl Layout {
         // one fillet radius above and below.
         let pill_block = pill_h + FILLET * 2.0 * scale;
         let h = pill_block.max(panels_h);
-        let w = CARD_W + CARD_GAP + PILL_W + 4.0;
+        let w = CARD_MARGIN + CARD_W + CARD_GAP + PILL_W + 4.0;
         Layout {
             scale,
             w: (w * scale).round() as i32,
             h: h.round() as i32,
-            pill_left: (CARD_W + CARD_GAP) * scale,
+            pill_left: (CARD_MARGIN + CARD_W + CARD_GAP) * scale,
             // Both rounded. With a fractional height the top edge lands on one subpixel phase and
             // the bottom on another, and the two fillets come out visibly different shapes.
             pill_top: ((h - pill_h) / 2.0).round(),
@@ -861,6 +865,16 @@ fn main() {
                     "hook event -> {}",
                     readings.iter().map(|(p, r)| format!("{p}={:?}", r.work)).collect::<Vec<_>>().join(" ")
                 ));
+                // A hook event can add a session line, which makes the panel taller. Without this
+                // the window keeps its old height and the panel is clipped — the poll path already
+                // resized, this one did not.
+                let wanted = Layout::new(cfg.scale * dpi, providers.len(), panels_height(&lay, &readings));
+                if wanted.h != lay.h {
+                    lay = wanted;
+                    canvas = Canvas::new(lay.w, lay.h);
+                    shown_x = mon.right - lay.w;
+                    y = mon.top + ((mon.bottom - mon.top) as f32 * cfg.notch_y - lay.h as f32 / 2.0).round() as i32;
+                }
                 dirty = true;
             }
 
@@ -1218,6 +1232,16 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_has_room_for_its_own_edge() {
+        // It used to start at exactly x=0, so its rounded corner and hairline were cut off by the
+        // canvas. The window has to be wider than panel plus gap plus pill.
+        let lay = Layout::new(1.0, 2, 0.0);
+        let panel_left = lay.pill_left - CARD_GAP - CARD_W;
+        assert!(panel_left >= 4.0, "the panel starts at {panel_left}, flush with the edge");
+        assert!((lay.w as f32) - lay.pill_left >= PILL_W, "and the pill still fits");
+    }
+
+    #[test]
     fn the_window_fits_the_tallest_panel_not_all_of_them() {
         // Only one panel is ever out, so the window has to cover the largest rather than the sum.
         let lay = Layout::new(1.0, 2, 0.0);
@@ -1466,6 +1490,84 @@ mod tests {
             .enumerate()
             .filter(|(i, px)| ((*i as i32) % lay.w) < (lay.pill_left as i32) - 20 && px[3] > 8)
             .count()
+    }
+
+    /// Writes what the pill actually looks like to a PNG, so a shape bug can be looked at instead
+    /// of guessed at from a screenshot. Ignored by default: it is a darkroom, not an assertion.
+    /// `cargo test -p codenotch-native --release -- --ignored dump_the_pill --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_the_pill() {
+        use resvg::tiny_skia;
+        let lay = Layout::new(1.2, 2, 0.0);
+        let readings = vec![
+            ("claude", reading(Some(0.27), Work::Idle)),
+            ("codex", reading(Some(0.02), Work::Idle)),
+        ];
+        // Which panel to dump comes from the environment, so both can be looked at without edits.
+        let which: usize = std::env::var("DUMP_PANEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let open = std::env::var("DUMP_OPEN").is_ok();
+        let needed = panels_height(&lay, &readings);
+        let lay = Layout::new(1.2, 2, needed);
+        let mut c = Canvas::new(lay.w, lay.h);
+        render(
+            &mut c,
+            &Frame { lay: &lay, readings: &readings, cs: 1.0, card: if open { 1.0 } else { 0.0 }, t: 0.0, panel: Some(which) },
+            &mut Marks::default(),
+            &mut Text::system().unwrap(),
+        );
+
+        let mut pm = tiny_skia::Pixmap::new(lay.w as u32, lay.h as u32).unwrap();
+        // The canvas is premultiplied BGRA; a Pixmap is premultiplied RGBA, so only B and R swap.
+        // Composited over mid-grey first, or a dark shape on a transparent page is unreadable.
+        for (dst, src) in pm.pixels_mut().iter_mut().zip(c.buf.chunks(4)) {
+            let (b, g, r, a) = (src[0] as u32, src[1] as u32, src[2] as u32, src[3] as u32);
+            let over = |c: u32| ((c + 96 * (255 - a) / 255).min(255)) as u8;
+            *dst = tiny_skia::PremultipliedColorU8::from_rgba(over(r), over(g), over(b), 255).unwrap();
+        }
+        let out = std::env::temp_dir().join("pill.png");
+        pm.save_png(&out).unwrap();
+        println!("escrito: {} ({}x{})", out.display(), lay.w, lay.h);
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_the_pill() {
+        let lay = Layout::new(1.2, 2, 0.0);
+        let readings = vec![
+            ("claude", reading(Some(0.27), Work::Idle)),
+            ("codex", reading(Some(0.02), Work::Idle)),
+        ];
+        let c = paint(&lay, &readings, 0.0, 0.0);
+        let at = |x: i32, y: i32| {
+            let i = ((y * lay.w + x) * 4) as usize;
+            (c.buf[i + 2], c.buf[i + 1], c.buf[i], c.buf[i + 3])
+        };
+        println!("janela {}x{} pill_top={} pill_h={}", lay.w, lay.h, lay.pill_top, lay.pill_h);
+        let mid_x = lay.w - 35;
+        println!("centro da pill      {:?}", at(mid_x, lay.h / 2));
+        println!("entre os aneis      {:?}", at(mid_x, (lay.pill_top + lay.pill_h / 2.0) as i32));
+        println!("canto sup esq pill  {:?}", at((lay.pill_left + 8.0) as i32, lay.pill_top as i32 + 40));
+
+        // Perfil vertical na coluna encostada na borda: as duas pontas tem que ser espelho
+        let col = lay.w - 2;
+        let top_edge = lay.pill_top as i32;
+        // Last row the pill occupies, not the first one past it: off by one here makes a
+        // symmetric shape look lopsided, which cost me a diagnosis.
+        let bot_edge = (lay.pill_top + lay.pill_h) as i32 - 1;
+        println!("
+coluna x={col}, alpha subindo do topo da pill:");
+        for d in 0..6 {
+            println!("  topo -{d:>2}px alpha={:>3}   base +{d:>2}px alpha={:>3}",
+                at(col, top_edge - d).3, at(col, (bot_edge + d).min(lay.h - 1)).3);
+        }
+        println!("
+largura solida (alpha>200) por linha, do topo e da base:");
+        for d in [0, 4, 8, 16, 24, 30] {
+            let w_top = (0..lay.w).filter(|x| at(*x, (top_edge - d).max(0)).3 > 200).count();
+            let w_bot = (0..lay.w).filter(|x| at(*x, (bot_edge + d).min(lay.h - 1)).3 > 200).count();
+            println!("  {d:>2}px  topo={w_top:>3}  base={w_bot:>3}");
+        }
     }
 
     #[test]

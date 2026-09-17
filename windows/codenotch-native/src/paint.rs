@@ -118,36 +118,38 @@ impl Canvas {
         if r <= 0.0 {
             return;
         }
-        // The punched-out circle is centred on the square's outer corner: the far side vertically,
-        // and inset by r from the screen edge.
-        let ccx = right - r;
-        let ccy = if above { edge_y - r } else { edge_y + r };
-        // Overlapping the panel's own edge by a pixel, not stopping at it. The panel draws a
-        // hairline all the way round, including along the edge the fillet joins, and leaving that
-        // line exposed puts a visible rule across the join. notch.html solves it the same way:
-        // "covers the 1 px stroke along the pill's top edge so there is no seam".
+        // Overlapping the panel's own edge, not stopping at it. The panel draws a hairline all the
+        // way round, including along the edge the fillet joins, and leaving that line exposed puts
+        // a visible rule across the join. notch.html solves it the same way: "covers the 1 px
+        // stroke along the pill's top edge so there is no seam".
         const OVERLAP: f32 = 1.5;
+
+        // Everything below is a function of `dy`: how far the pixel is from the panel's edge, going
+        // outward. Writing it this way rather than in absolute coordinates is what makes the two
+        // ends mirror images. They did not used to: with `py > edge_y` as the test, the half-pixel
+        // sample offset put the edge row inside the overlap at the top and outside it at the
+        // bottom, and one row of difference showed up as tens of pixels of width.
+        let ccx = right - r;
+        let x0 = ccx.floor().max(0.0) as i32;
+        let x1 = right.ceil().min(self.w as f32) as i32;
         let (y0, y1) = if above {
             (edge_y - r, edge_y + OVERLAP)
         } else {
             (edge_y - OVERLAP, edge_y + r)
         };
-        let x0 = ccx.floor().max(0.0) as i32;
-        let x1 = right.ceil().min(self.w as f32) as i32;
-        let y0i = y0.floor().max(0.0) as i32;
-        let y1i = y1.ceil().min(self.h as f32) as i32;
-        for y in y0i..y1i {
+        for y in y0.floor().max(0.0) as i32..y1.ceil().min(self.h as f32) as i32 {
+            let py = y as f32 + 0.5;
+            let dy = if above { edge_y - py } else { py - edge_y };
             for x in x0..x1 {
-                let py = y as f32 + 0.5;
-                let d = (x as f32 + 0.5 - ccx).hypot(py - ccy);
-                // Past the panel's edge, inside the overlap, the fill is unconditional: that strip
+                // The punched-out circle sits `r` out from the edge, inset `r` from the screen.
+                let d = (x as f32 + 0.5 - ccx).hypot(dy - r);
+                // Inside the panel, in the overlap strip, the fill is unconditional: that strip
                 // exists to bury the hairline, not to be shaped by the arc.
-                let past_edge = if above { py > edge_y } else { py < edge_y };
-                let cover = if past_edge { 1.0 } else { smoothstep(r - 0.5, r + 0.5, d) };
+                let cover = if dy < 0.0 { 1.0 } else { smoothstep(r - 0.5, r + 0.5, d) };
                 self.put(x, y, rgb, cover);
                 // The arc carries the panel's outline onward, so the shape keeps its edge against a
-                // dark wallpaper. Only along the curve itself, never across the overlap strip.
-                if !past_edge {
+                // dark wallpaper. Only along the curve, never across the overlap strip.
+                if dy >= 0.0 {
                     let seam = 1.0 - smoothstep(0.0, 1.0, (d - r).abs());
                     self.put(x, y, stroke, seam * 0.55);
                 }
