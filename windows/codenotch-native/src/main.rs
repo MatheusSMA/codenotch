@@ -30,11 +30,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use text::Text;
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ---------------------------------------------------------------- design sizes
@@ -74,6 +74,11 @@ const BAR_H: f32 = 7.0;
 const BAR_GAP: f32 = 6.0;
 
 const PEEK: f32 = 6.0; // how much stays on screen when tucked away
+/// How far in from the edge the push that opens the pill is still read as a push. It is deliberately
+/// much narrower than the area that keeps the pill out: reaching for the edge is a deliberate move,
+/// while a pointer that merely passes near it is not asking for anything. Widen it if the edge
+/// starts feeling like it has to be hit exactly.
+const REVEAL_REACH: f32 = 16.0;
 const HOVER_PAD: f32 = 12.0;
 /// Extra room the pointer gets before the pill decides it has left. Without it a single threshold
 /// plus an unsteady hand is a switch being flicked: a pointer resting near the edge crosses it
@@ -124,9 +129,15 @@ const REVEAL_DURATION: f32 = 0.34;
 const REVEAL_BOUNCE: f32 = 0.28; // passes the target once and settles
 const DISMISS_DURATION: f32 = 0.95; // about 665 ms visible, comfortably past Apple's default
 const DISMISS_BOUNCE: f32 = 0.04; // all but critically damped: no wobble on the way out
-/// The panel's own box closes slower still, and without any bounce. It is the thing being read, so
-/// it is the last to go and the calmest about it.
-const PANEL_CLOSE_DURATION: f32 = 1.1;
+/// The panel's own box closes slower than a swap and without any bounce: it is the thing being
+/// read, so it is not snatched away.
+///
+/// It was 1.1 — longer than the pill's own exit, on the reasoning that the panel should be the last
+/// to go. Reported as stuck, and it was: the pill cannot start retracting until the panel is nearly
+/// gone, so leaving ran 1.1 then 0.95 end to end, close to two seconds, with the middle of it spent
+/// on a fade already too faint to see. It now hands over to the pill while it is still faintly on
+/// screen, and the two read as one departure.
+const PANEL_CLOSE_DURATION: f32 = 0.55;
 /// Closing on the way to another panel is a different move from closing for good. Nobody is waiting
 /// on a dismissal, but during a swap the next panel is what you asked for, so the shut half has to
 /// get out of the way.
@@ -141,7 +152,12 @@ const SWAP_CARRY: f32 = 0.55;
 /// While a panel is still on screen the pill stays out, however the pointer left. The panel is
 /// drawn inside the window, so retracting first does not animate it away — it drags it off the
 /// edge, and what the eye sees is the panel being cut rather than closing.
-const PANEL_LINGER: f32 = 0.04;
+///
+/// Where this sits decides whether leaving is one move or two. At 0.04 the pill waited out all but
+/// the last invisible sliver of the fade, which left a dead beat — panel already gone, pill not yet
+/// moving — and that beat is what read as leaving being stuck. Handing over at 0.12, faint but not
+/// yet nothing, overlaps them.
+const PANEL_LINGER: f32 = 0.12;
 
 /// The sliver left at the edge is faint rather than invisible: it has to be findable, or the hover
 /// target is a secret. Raise it if it needs to be more obvious, drop it to 0.0 to hide it outright.
@@ -506,6 +522,17 @@ fn card_target(shown: Option<usize>, want: Option<usize>) -> f32 {
     if shown.is_some() && shown == want { 1.0 } else { 0.0 }
 }
 
+/// The speed the card spring keeps once its contents have been swapped out under it.
+///
+/// A swap reflects it, so the panel that was asked for starts already moving and the pair reads as
+/// one gesture bouncing off the bottom. A dismissal must not, and used to: the same branch runs for
+/// `Some -> None`, so closing for good turned round and climbed back up with nothing left to draw.
+/// `pill_target` holds the pill out for as long as the card is above `PANEL_LINGER`, so that climb
+/// was paid for as a stall on an empty panel column before the pill could start retracting.
+fn carry_through(want: Option<usize>, vel: f32) -> f32 {
+    if want.is_some() { -vel * SWAP_CARRY } else { 0.0 }
+}
+
 /// How far along a staggered item is, given the panel's own progress. Rows arrive one after the
 /// other rather than all at once — the "per object" sequencing in Apple's own motion work — and
 /// each one eases out on its own. `i` is the row's place in the order, `n` how many there are.
@@ -811,6 +838,42 @@ unsafe fn set_click_through(hwnd: HWND, on: bool) {
     }
 }
 
+/// There is no tray icon and no settings window, so this menu is the only handle on the process
+/// itself: the way to pick up a new build, and the way to stop it.
+const MENU_RESTART: usize = 1;
+const MENU_QUIT: usize = 2;
+
+/// Opens it at the pointer and returns what was picked, or 0 if it was dismissed.
+///
+/// The calls around `TrackPopupMenu` are the documented pair rather than superstition. A popup menu
+/// only closes on a click elsewhere when its owner is the foreground window, and this one is
+/// `WS_EX_NOACTIVATE` precisely so that hovering the pill never steals focus — so the style comes
+/// off for as long as the menu is up and goes straight back on. Right-aligned because the pill sits
+/// against the right edge of the screen, where a left-aligned menu would open off it.
+unsafe fn pill_menu(hwnd: HWND, at: POINT) -> usize {
+    let Ok(menu) = CreatePopupMenu() else { return 0 };
+    let _ = AppendMenuW(menu, MF_STRING, MENU_RESTART, w!("Restart"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit"));
+
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_NOACTIVATE.0 as isize));
+    let _ = SetForegroundWindow(hwnd);
+    let picked = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RIGHTALIGN,
+        at.x,
+        at.y,
+        0,
+        hwnd,
+        None,
+    );
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+    let _ = DestroyMenu(menu);
+    picked.0 as usize
+}
+
 fn main() {
     unsafe {
         // Without this the monitor rectangle comes back in scaled coordinates and the pill lands
@@ -867,10 +930,19 @@ fn main() {
         // it keeps working, it just cannot show amber.
         let hub = Arc::new(Hub::default());
         let owns_hooks = hooks::start(hub.clone(), HOOK_PORT);
+        // Losing the bind means a second instance: `start` already retried for two seconds, which
+        // covers a restart from the pill's own menu inheriting the port from the outgoing process.
+        // The hook spawns this binary whenever its POST cannot connect — including while the first
+        // one is still booting — so without this the machine collects pills that never hear an
+        // event and shadow the real one at the edge.
+        if !owns_hooks {
+            trace("second instance: the hook port is taken, leaving");
+            return;
+        }
         // Wire Claude Code's hooks at startup if they are not already pointing here. Without them
         // nothing posts to the port above, and `attention` can never fire: it is the one state with
         // no signature on disk. Installing is idempotent and backs the settings file up first.
-        if owns_hooks && !hooks_install::is_installed() {
+        if !hooks_install::is_installed() {
             match hooks_install::install() {
                 Ok(msg) => trace(&format!("hooks installed: {msg}")),
                 Err(e) => trace(&format!("hooks not installed: {e}")),
@@ -923,8 +995,13 @@ fn main() {
         let mut panel_want: Option<usize> = None;
         let mut panel_shown: Option<usize> = None;
         let mut was_down = false;
+        let mut was_right = false;
         // When the pointer first went outside, or None while it is inside.
         let mut left_at: Option<Instant> = None;
+        // Where the pointer was last frame, and whether it was already in the edge strip: the
+        // reveal triggers on the crossing, so it needs both.
+        let mut was_at_edge = false;
+        let mut prev_x = i32::MAX;
         let mut click_through = true;
         let mut dirty = true;
         let mut pos = hidden_x as f32;
@@ -953,7 +1030,7 @@ fn main() {
 
             // A hook event is the whole point of holding the port: an answer waiting on the user
             // should light up now, not on the next two-second tick.
-            if owns_hooks && hub.take_changed() {
+            if hub.take_changed() {
                 readings = providers.iter().map(|p| (*p, read_provider(p, &hub))).collect();
                 trace(&format!(
                     "hook event -> {}",
@@ -1028,10 +1105,20 @@ fn main() {
             let in_rows = (cur.y as f32) >= y as f32 - pad - if shown { HOVER_HYSTERESIS } else { 0.0 }
                 && (cur.y as f32) <= (y + lay.h) as f32 + pad + if shown { HOVER_HYSTERESIS } else { 0.0 };
             let inside = in_rows && (cur.x as f32) >= edge;
+            // Opening asks for an outward push into a strip at the very edge, not mere presence
+            // anywhere in the area that keeps the pill out. The pointer has to cross into that
+            // strip while travelling towards the edge, so a pointer parked out there — on a
+            // settings pane pinned to the side, or coming down the edge from above — never crosses
+            // anything, and the pill stays put instead of covering what is under it.
+            let reveal_edge = edge_strip - REVEAL_REACH * cfg.scale * dpi;
+            let at_edge = in_rows && (cur.x as f32) >= reveal_edge;
+            let pushed_out = at_edge && !was_at_edge && cur.x > prev_x;
+            was_at_edge = at_edge;
+            prev_x = cur.x;
 
             // Leaving waits; arriving does not. A pointer on its way past should not open it, but
             // it definitely should not close it either.
-            let want = if inside {
+            let want = if inside && (shown || pushed_out) {
                 left_at = None;
                 true
             } else if !shown {
@@ -1060,6 +1147,30 @@ fn main() {
                 trace(&format!("click cell={hit:?} panel={panel_want:?}"));
             }
             was_down = down;
+
+            // Right-click is the whole settings surface. `TrackPopupMenu` blocks here until the
+            // menu closes, which freezes the pill mid-frame; `dt` is clamped further down, so the
+            // frame that comes back afterwards cannot launch the springs across the screen.
+            let right = GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
+            if right && !was_right && over_pill && shown {
+                match pill_menu(hwnd, cur) {
+                    MENU_RESTART => {
+                        // The outgoing process still holds the hook port for a moment; the new one
+                        // retries the bind rather than starting up deaf to events.
+                        if let Ok(exe) = std::env::current_exe() {
+                            let _ = std::process::Command::new(exe).spawn();
+                        }
+                        std::process::exit(0);
+                    }
+                    MENU_QUIT => std::process::exit(0),
+                    _ => {}
+                }
+                // Both buttons may still be down on the way back, and a stale edge here would open
+                // a panel nobody clicked on.
+                was_down = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0;
+                last_frame = Instant::now();
+            }
+            was_right = right;
 
             if want != shown {
                 trace(&format!(
@@ -1105,10 +1216,7 @@ fn main() {
             }
             if card.value < PANEL_GONE && panel_shown != panel_want {
                 panel_shown = panel_want;
-                // Turn the speed around instead of discarding it. The panel is still moving when
-                // the contents change, so the swap reads as one gesture that bounces off the
-                // bottom rather than two that meet at a standstill.
-                card.vel = -card.vel * SWAP_CARRY;
+                card.vel = carry_through(panel_want, card.vel);
             }
 
             // The pill waits for the panel to finish leaving before it retracts, or the panel goes
@@ -1493,7 +1601,7 @@ mod tests {
         const APPLE_DEFAULT_DURATION: f32 = 0.5;
         assert!(DISMISS_DURATION > REVEAL_DURATION, "leaving should outlast arriving");
         assert!(DISMISS_DURATION > APPLE_DEFAULT_DURATION, "and outlast a stock spring too");
-        assert!(PANEL_CLOSE_DURATION >= DISMISS_DURATION, "the panel should be the last to go");
+        assert!(PANEL_CLOSE_DURATION > PANEL_SWAP_DURATION, "and closing for good outlasts a swap");
         assert!(DISMISS_BOUNCE < 0.1, "a dismissal should not wobble");
     }
 
@@ -1517,8 +1625,38 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_outlasts_the_pill_on_the_way_out() {
-        assert!(visible_frames(PANEL_CLOSE_DURATION, 0.0) >= visible_frames(DISMISS_DURATION, DISMISS_BOUNCE));
+    fn a_dismissal_settles_instead_of_bouncing() {
+        // The bug this exists for. The swap's velocity reflection fired on dismissals too, because
+        // drawn and wanted differ there as well — so closing for good turned round at the bottom
+        // and climbed back up with nothing left to draw, and `pill_target` held the pill out for
+        // the whole climb. A stall on an empty panel column is what read as leaving being stuck.
+        assert_eq!(carry_through(None, -2.0), 0.0, "closing for good stops at the bottom");
+        assert!(carry_through(Some(1), -2.0) > 0.0, "a swap turns round and heads back out");
+
+        let mut card = Spring::new(PANEL_GONE, PANEL_CLOSE_DURATION, 0.0);
+        card.vel = carry_through(None, -0.6);
+        let mut prev = card.value;
+        for _ in 0..120 {
+            card.step(0.0, 1.0 / 60.0);
+            assert!(card.value <= prev + 1e-6, "it climbed from {prev:.4} to {:.4}", card.value);
+            prev = card.value;
+        }
+    }
+
+    #[test]
+    fn leaving_is_one_move_rather_than_two() {
+        // The pill used to wait out all but the last invisible sliver of the panel's fade, so a
+        // dismissal was the panel's close and then the pill's, end to end. It now takes over while
+        // the panel is still faintly on screen — but not before, or the panel is dragged off the
+        // edge while it is still readable instead of being allowed to close.
+        let closing = run(1.0, 0.0, PANEL_CLOSE_DURATION, 0.0);
+        let held = closing.iter().take_while(|v| pill_target(false, **v) > 0.5).count();
+        let fade = closing.iter().take_while(|v| **v > 0.05).count();
+        assert!(held > 0, "the pill must not bolt while the panel is still solid");
+        assert!(held < fade, "the pill still waits out the whole fade: {held} of {fade} frames");
+
+        let end_to_end = (held + visible_frames(DISMISS_DURATION, DISMISS_BOUNCE)) as f32 / 60.0;
+        assert!(end_to_end < 1.25, "leaving takes {end_to_end:.2}s, which reads as waiting");
     }
 
     #[test]
@@ -1743,6 +1881,25 @@ mod tests {
             let p = place(v);
             assert!((shown_x..=hidden_x).contains(&p), "position left its track at {v}: {p}");
         }
+    }
+
+    /// Mirrors the loop: only a crossing made while travelling outwards opens it.
+    fn pushed_out(prev_x: i32, was_at_edge: bool, cur_x: i32, at_edge: bool) -> bool {
+        at_edge && !was_at_edge && cur_x > prev_x
+    }
+
+    #[test]
+    fn only_an_outward_push_opens_the_pill() {
+        // Walking out to the edge: cold, then crossing rightwards into the strip.
+        assert!(pushed_out(3000, false, 3425, true), "a push to the edge should open it");
+        // Parked out there already - a pane pinned to the side, a pointer left on the strip.
+        assert!(!pushed_out(3400, true, 3400, true), "presence alone must not open it");
+        // Coming down the edge from above: the row band turns true without any sideways travel.
+        assert!(!pushed_out(3400, false, 3400, true), "a vertical arrival must not open it");
+        // Crossing back inwards.
+        assert!(!pushed_out(3400, false, 3380, true), "moving inwards must not open it");
+        // First frame, before there is a previous position to compare against.
+        assert!(!pushed_out(i32::MAX, false, 3400, true), "startup must not open it");
     }
 
     #[test]
