@@ -76,9 +76,10 @@ const BAR_GAP: f32 = 6.0;
 const PEEK: f32 = 6.0; // how much stays on screen when tucked away
 /// How far in from the edge the push that opens the pill is still read as a push. It is deliberately
 /// much narrower than the area that keeps the pill out: reaching for the edge is a deliberate move,
-/// while a pointer that merely passes near it is not asking for anything. Widen it if the edge
-/// starts feeling like it has to be hit exactly.
-const REVEAL_REACH: f32 = 16.0;
+/// while a pointer that merely passes near it is not asking for anything. Sized to `PEEK`, so the
+/// push has to land on the sliver that is actually on screen. Widen it if the edge starts feeling
+/// like it has to be hit exactly.
+const REVEAL_REACH: f32 = PEEK;
 const HOVER_PAD: f32 = 12.0;
 /// Extra room the pointer gets before the pill decides it has left. Without it a single threshold
 /// plus an unsteady hand is a switch being flicked: a pointer resting near the edge crosses it
