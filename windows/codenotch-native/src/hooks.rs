@@ -12,6 +12,7 @@ use crate::usage::UsageSnapshot;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// What the server and the render loop share: the session table, and a flag saying it moved.
 #[derive(Default)]
@@ -41,9 +42,18 @@ impl Hub {
 /// Binds the hook port. Returns false when something else already holds it — which in practice
 /// means the original app is still running, and the caller should say so rather than sit silent.
 pub fn start(hub: Arc<Hub>, port: u16) -> bool {
-    let server = match tiny_http::Server::http(("127.0.0.1", port)) {
-        Ok(s) => s,
-        Err(_) => return false,
+    // Retried rather than tried once. Restarting from the pill's own menu spawns the replacement
+    // before the outgoing process has exited, so the port is still held for a moment; an instance
+    // that gave up here would run on deaf to hook events, and `attention` is the one state with no
+    // signature on disk, so amber would simply never fire again. A genuine second instance pays
+    // two seconds and then loses, which is the right outcome for it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let server = loop {
+        match tiny_http::Server::http(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => return false,
+        }
     };
     std::thread::spawn(move || {
         for mut req in server.incoming_requests() {
