@@ -80,6 +80,11 @@ const PEEK: f32 = 6.0; // how much stays on screen when tucked away
 /// push has to land on the sliver that is actually on screen. Widen it if the edge starts feeling
 /// like it has to be hit exactly.
 const REVEAL_REACH: f32 = PEEK;
+/// How long a push towards the edge stays good for. The pointer hits the side of the screen well
+/// before it reaches the pill's rows and then slides along the wall, where `x` cannot grow any
+/// further — without a grace period that slide is indistinguishable from a pointer that was parked
+/// there all along, and the pill would only ever open for a push that landed on the rows exactly.
+const PUSH_GRACE: Duration = Duration::from_millis(700);
 const HOVER_PAD: f32 = 12.0;
 /// Extra room the pointer gets before the pill decides it has left. Without it a single threshold
 /// plus an unsteady hand is a switch being flicked: a pointer resting near the edge crosses it
@@ -999,9 +1004,9 @@ fn main() {
         let mut was_right = false;
         // When the pointer first went outside, or None while it is inside.
         let mut left_at: Option<Instant> = None;
-        // Where the pointer was last frame, and whether it was already in the edge strip: the
-        // reveal triggers on the crossing, so it needs both.
-        let mut was_at_edge = false;
+        // Where the pointer was last frame, and when it last pushed outwards inside the edge
+        // strip: the reveal triggers on that push, not on the pointer merely being there.
+        let mut pushed_at: Option<Instant> = None;
         let mut prev_x = i32::MAX;
         let mut click_through = true;
         let mut dirty = true;
@@ -1112,9 +1117,13 @@ fn main() {
             // settings pane pinned to the side, or coming down the edge from above — never crosses
             // anything, and the pill stays put instead of covering what is under it.
             let reveal_edge = edge_strip - REVEAL_REACH * cfg.scale * dpi;
-            let at_edge = in_rows && (cur.x as f32) >= reveal_edge;
-            let pushed_out = at_edge && !was_at_edge && cur.x > prev_x;
-            was_at_edge = at_edge;
+            let at_edge = (cur.x as f32) >= reveal_edge;
+            if !at_edge {
+                pushed_at = None;
+            } else if cur.x > prev_x {
+                pushed_at = Some(Instant::now());
+            }
+            let pushed_out = in_rows && pushed_at.is_some_and(|t| t.elapsed() < PUSH_GRACE);
             prev_x = cur.x;
 
             // Leaving waits; arriving does not. A pointer on its way past should not open it, but
@@ -1884,23 +1893,46 @@ mod tests {
         }
     }
 
-    /// Mirrors the loop: only a crossing made while travelling outwards opens it.
-    fn pushed_out(prev_x: i32, was_at_edge: bool, cur_x: i32, at_edge: bool) -> bool {
-        at_edge && !was_at_edge && cur_x > prev_x
+    /// Mirrors the loop: a push outwards inside the edge strip arms the reveal, leaving the strip
+    /// disarms it, and only an armed pointer that reaches the rows opens the pill.
+    fn push_step(
+        armed: Option<Instant>,
+        prev_x: i32,
+        cur_x: i32,
+        reveal_edge: i32,
+        in_rows: bool,
+    ) -> (Option<Instant>, bool) {
+        let armed = if cur_x < reveal_edge {
+            None
+        } else if cur_x > prev_x {
+            Some(Instant::now())
+        } else {
+            armed
+        };
+        let open = in_rows && armed.is_some_and(|t| t.elapsed() < PUSH_GRACE);
+        (armed, open)
     }
 
     #[test]
     fn only_an_outward_push_opens_the_pill() {
-        // Walking out to the edge: cold, then crossing rightwards into the strip.
-        assert!(pushed_out(3000, false, 3425, true), "a push to the edge should open it");
-        // Parked out there already - a pane pinned to the side, a pointer left on the strip.
-        assert!(!pushed_out(3400, true, 3400, true), "presence alone must not open it");
-        // Coming down the edge from above: the row band turns true without any sideways travel.
-        assert!(!pushed_out(3400, false, 3400, true), "a vertical arrival must not open it");
-        // Crossing back inwards.
-        assert!(!pushed_out(3400, false, 3380, true), "moving inwards must not open it");
+        const EDGE: i32 = 3422;
+        // Walking out to the edge and straight onto the rows.
+        assert!(push_step(None, 3000, 3425, EDGE, true).1, "a push to the edge should open it");
+        // Parked out there - a pane pinned to the side, a pointer left on the strip.
+        assert!(!push_step(None, 3425, 3425, EDGE, true).1, "presence alone must not open it");
+        // Hitting the wall away from the rows, then sliding along it: `x` cannot grow at the wall,
+        // so the push that got there has to carry the pointer the rest of the way.
+        let (armed, open) = push_step(None, 3300, 3439, EDGE, false);
+        assert!(!open, "the push landed outside the rows, nothing to open yet");
+        assert!(push_step(armed, 3439, 3439, EDGE, true).1, "the slide along the wall should open it");
+        // Leaving the strip disarms: the same slide a second later, after a trip inland, is cold.
+        let (armed, _) = push_step(armed, 3439, 3000, EDGE, false);
+        assert!(armed.is_none(), "stepping off the strip must forget the push");
+        assert!(!push_step(armed, 3000, 3000, EDGE, true).1, "a forgotten push must not open it");
+        // Crossing back inwards while still on the strip.
+        assert!(!push_step(None, 3439, 3425, EDGE, true).1, "moving inwards must not open it");
         // First frame, before there is a previous position to compare against.
-        assert!(!pushed_out(i32::MAX, false, 3400, true), "startup must not open it");
+        assert!(!push_step(None, i32::MAX, 3425, EDGE, true).1, "startup must not open it");
     }
 
     #[test]
