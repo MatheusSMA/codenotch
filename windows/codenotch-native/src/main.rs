@@ -53,25 +53,37 @@ const MARK: f32 = 26.0;
 /// Radius of the concave arcs above and below the pill, from `--fillet` in notch.html.
 const FILLET: f32 = 26.0;
 
-// The detail panels, to the left of the pill. One per provider rather than a single card holding
-// all of them: each provider is its own thing, and stacked blocks inside one box made the divisions
-// hard to see. Wider and larger than notch.html's `#card`, which was sized for hover rather than
-// for reading.
-const CARD_W: f32 = 320.0;
-const CARD_GAP: f32 = 12.0;
+// The detail panel, to the left of the pill, one provider at a time. Sizes are notch.html's `#card`,
+// which reproduces the upstream design frame: 246 wide, 16 padding, 12/11 px type, a 4 px bar.
+const CARD_W: f32 = 246.0;
+/// Space between the card and the pill, spanned by the tail. notch.html puts the card's right edge
+/// 100 px from the window's and the pill is 70 wide.
+const CARD_GAP: f32 = 30.0;
+/// The tail: the curved wedge from `#tail` in notch.html, its point on the ring that opened it.
+const TAIL_W: f32 = 32.0;
+const TAIL_H: f32 = 36.0;
 /// Breathing room to the left of the panel. Without it the window was exactly wide enough for
 /// panel + gap + pill, so the panel started at x=0 and its own rounded corner and hairline were
 /// clipped off by the edge of the canvas.
 const CARD_MARGIN: f32 = 10.0;
-const CARD_PAD: f32 = 18.0;
+const CARD_PAD: f32 = 16.0;
 const CARD_RADIUS: f32 = 16.0;
-const TITLE_PX: f32 = 16.0;
-const ROW_PX: f32 = 13.0;
-const TITLE_GAP: f32 = 12.0;
-const ROW_GAP: f32 = 12.0;
-/// A usage bar reads at a glance; a number has to be compared against a limit you have to remember.
-const BAR_H: f32 = 7.0;
+/// `.c-title` and the mark beside it (`.c-head .mark`).
+const TITLE_PX: f32 = 14.0;
+const HEAD_MARK: f32 = 16.0;
+const HEAD_H: f32 = 16.0;
+/// `.c-head{margin-bottom:4px}` plus the first `.win{margin-top:10px}` is carried by ROW_GAP.
+const TITLE_GAP: f32 = 4.0;
+/// `.w-label`, 12 px.
+const ROW_PX: f32 = 12.0;
+/// `.w-reset` and `.w-used`, 11 px.
+const SMALL_PX: f32 = 11.0;
+/// `.win{margin-top:10px}`.
+const ROW_GAP: f32 = 10.0;
+/// `.w-track{height:4px;margin:6px 0 4px}`.
+const BAR_H: f32 = 4.0;
 const BAR_GAP: f32 = 6.0;
+const USED_GAP: f32 = 4.0;
 
 const PEEK: f32 = 6.0; // how much stays on screen when tucked away
 /// How far in from the edge the push that opens the pill is still read as a push. It is deliberately
@@ -190,13 +202,23 @@ const CONTENT_MIN_SCALE: f32 = 0.93;
 
 /// Pure white. notch.html uses #e8e8ea, which next to a black pill reads as grey.
 const INK: [f32; 3] = [1.0, 1.0, 1.0];
-const MUTED: [f32; 3] = [0.62, 0.62, 0.65];
-/// Amber, for a session waiting on an answer — the same cue `.arc-pulse` carries in notch.html.
-const WATCH: [f32; 3] = [0.98, 0.80, 0.08];
+/// `.w-label` and the card's title, #e8e8ea.
+const LABEL: [f32; 3] = [0.91, 0.91, 0.918];
+/// `.w-reset` / `.w-used`, #808080.
+const MUTED: [f32; 3] = [0.502, 0.502, 0.502];
+/// `.s-row`, #b0b0b3.
+const SESSION_INK: [f32; 3] = [0.69, 0.69, 0.702];
+/// Waiting borrows the warning yellow, #F2FF00, as `.arc-pulse` does in notch.html.
+const WATCH: [f32; 3] = [0.949, 1.0, 0.0];
 const PILL_BG: [f32; 3] = [0.0, 0.0, 0.0];
 const CARD_BG: [f32; 3] = [0.04, 0.04, 0.04];
 const PILL_EDGE: [f32; 3] = [0.18, 0.18, 0.18];
-const TRACK: [f32; 3] = [0.16, 0.16, 0.16];
+/// Ring track, #303030.
+const TRACK: [f32; 3] = [0.188, 0.188, 0.188];
+/// `.w-track`, #2d2d2d.
+const BAR_TRACK: [f32; 3] = [0.176, 0.176, 0.176];
+/// `.c-sessions{border-top:1px solid #1e1e1e}`.
+const RULE: [f32; 3] = [0.118, 0.118, 0.118];
 const DISC: [f32; 3] = [0.165, 0.165, 0.165];
 
 // ---------------------------------------------------------------- persisted data
@@ -209,6 +231,9 @@ struct Window_ {
     used: Option<f32>,
     #[serde(default)]
     count: Option<i64>,
+    /// Epoch milliseconds, as usage.rs and codex.rs persist it.
+    #[serde(default)]
+    resets_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -228,7 +253,8 @@ struct Reading {
     /// `.dim{opacity:.55}` rather than hiding them, so a number the user saw a minute ago does not
     /// turn into a dash the moment a refresh is late.
     stale: bool,
-    rows: Vec<(String, Option<f32>)>,
+    /// Label, fraction used, and when the window resets (epoch ms).
+    rows: Vec<(String, Option<f32>, Option<i64>)>,
     work: Work,
     /// Live sessions, when hook events are reaching us. Empty for providers with no hooks.
     sessions: Vec<(String, String)>,
@@ -330,7 +356,7 @@ fn reading_of(snap: &Snapshot, now: i64) -> Reading {
             .iter()
             .map(|w| {
                 let label = if w.label.is_empty() { w.id.clone() } else { w.label.clone() };
-                (label, if w.count.is_none() { w.used } else { None })
+                (label, if w.count.is_none() { w.used } else { None }, w.resets_at)
             })
             .collect(),
         work: Work::Idle,
@@ -607,7 +633,7 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
     let toward_mid = |y: f32| mid + (y - mid) * f.cs;
 
     if f.card > 0.01 {
-        draw_panels(c, f, font);
+        draw_panels(c, f, marks, font);
     }
 
     // The pill body, pushed right by its radius so only the left corners round, as on screen.
@@ -676,12 +702,13 @@ fn panel_height(lay: &Layout, r: &Reading) -> f32 {
     let s = lay.scale;
     let rows = r.rows.len().max(1) as f32;
     let mut h = CARD_PAD * 2.0 * s;
-    h += TITLE_PX * s + TITLE_GAP * s;
-    // Each limit is a label line and the bar under it.
-    h += rows * (ROW_PX + BAR_GAP + BAR_H) * s + (rows - 1.0) * ROW_GAP * s;
+    h += HEAD_H * s + TITLE_GAP * s;
+    // Each limit: the label line, the bar, and the "n% Used" line under it.
+    h += rows * (ROW_GAP + ROW_PX + BAR_GAP + BAR_H + USED_GAP + SMALL_PX) * s;
     if !r.sessions.is_empty() {
-        h += ROW_GAP * s;
-        h += r.sessions.len() as f32 * ROW_PX * s + (r.sessions.len() as f32 - 1.0) * ROW_GAP * 0.5 * s;
+        // `.c-sessions{margin-top:12px;padding-top:8px}`, then one 11 px row each.
+        h += (12.0 + 8.0) * s;
+        h += r.sessions.len() as f32 * (SMALL_PX + 4.0) * s;
     }
     h
 }
@@ -698,7 +725,7 @@ fn draw_bar(c: &mut Canvas, left: f32, top: f32, w: f32, h: f32, used: Option<f3
     let r = h / 2.0;
     // `a` is the panel's fade. It used to be ignored here, so while the panel faded in the bars
     // were already at full strength — they arrived before the box around them.
-    c.round_rect(left + w / 2.0, top + r, w / 2.0, r, r, TRACK, None, a);
+    c.round_rect(left + w / 2.0, top + r, w / 2.0, r, r, BAR_TRACK, None, a);
     let Some(u) = used else { return };
     let frac = u.clamp(0.0, 1.0);
     if frac <= 0.0 {
@@ -709,93 +736,119 @@ fn draw_bar(c: &mut Canvas, left: f32, top: f32, w: f32, h: f32, used: Option<f3
     c.round_rect(left + fill / 2.0, top + r, fill / 2.0, r, r, band(u), None, a);
 }
 
-/// The panel of whichever ring was clicked. One at a time: two panels side by side turned the
-/// glance into a search, and a provider's detail belongs to that provider's ring.
-fn draw_panels(c: &mut Canvas, f: &Frame, font: &mut Text) {
+/// "Resets in 51 min" under an hour, "Resets Thu 12:00 AM" within the week, "Resets Sep 28" beyond
+/// it: upstream's `ResetCopy.text` in its automatic format.
+fn reset_copy(resets_at_ms: i64, now_ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    let secs = (resets_at_ms - now_ms) as f64 / 1000.0;
+    if secs <= 0.0 {
+        return "Resetting…".into();
+    }
+    // Rounding, not truncation, so 50m40s reads as 51; one that rounds to 60 takes the clock form.
+    let minutes = (secs / 60.0).round() as i64;
+    if minutes < 60 {
+        return format!("Resets in {} min", minutes.max(1));
+    }
+    let Some(at) = Local.timestamp_millis_opt(resets_at_ms).single() else {
+        return String::new();
+    };
+    let today = Local::now().date_naive();
+    if (at.date_naive() - today).num_days() >= 7 {
+        return format!("Resets {}", at.format("%b %-d"));
+    }
+    format!("Resets {}", at.format("%a %-I:%M %p"))
+}
+
+/// The panel of whichever ring was clicked, drawn as upstream's tooltip card: the provider's mark
+/// and "<Name> Usage", then one block per limit (label and reset time, a thin bar, "n% Used") and
+/// a curved tail whose point sits on the ring that opened it.
+fn draw_panels(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
     let (lay, s) = (f.lay, f.lay.scale);
     let Some(idx) = f.panel else { return };
     let Some((provider, r)) = f.readings.get(idx) else { return };
     let w = CARD_W * s;
     // It slides the last few pixels in as it fades, so it arrives rather than blinking on.
-    let left = lay.pill_left - CARD_GAP * s - w + (1.0 - f.card) * 12.0 * s;
+    let slide = (1.0 - f.card) * 12.0 * s;
+    let left = lay.pill_left - CARD_GAP * s - w + slide;
     let a = f.card;
+    let now = now_ms();
 
-    {
-        let h = panel_height(lay, r);
-        // Centred on its own ring rather than on the window: the panel points at what opened it.
-        let ring_mid = lay.pill_top + PAD_Y * s + idx as f32 * (lay.cell_h + GAP) * s + RING_BOX / 2.0 * s;
-        let top = (ring_mid - h / 2.0).clamp(0.0, (lay.h as f32 - h).max(0.0));
-        c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, Some(PILL_EDGE), a);
+    let h = panel_height(lay, r);
+    // Centred on its own ring rather than on the window: the panel points at what opened it.
+    let ring_mid = lay.pill_top + PAD_Y * s + idx as f32 * (lay.cell_h + GAP) * s + RING_BOX / 2.0 * s;
+    let top = (ring_mid - h / 2.0).clamp(0.0, (lay.h as f32 - h).max(0.0));
+    c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, None, a);
+    // The tail spans the gap, overlapping the card by a pixel so the two read as one shape.
+    c.tail(left + w - 1.0 * s, ring_mid, TAIL_W * s, TAIL_H * s, CARD_BG, a);
 
-        let text_left = left + CARD_PAD * s;
-        let text_right = left + w - CARD_PAD * s;
-        let inner_w = text_right - text_left;
-        let mut y = top + CARD_PAD * s + TITLE_PX * s;
+    let text_left = left + CARD_PAD * s;
+    let text_right = left + w - CARD_PAD * s;
+    let inner_w = text_right - text_left;
+    let mut y = top + CARD_PAD * s;
 
-        font.left_aligned(c, pretty(provider), text_left, y, TITLE_PX * s, INK, a);
-        let tag = match r.work {
-            Work::Attention => Some(("waiting on you", WATCH)),
-            Work::Running => Some(("working", INK)),
-            Work::Idle if r.stale => Some(("stale", MUTED)),
-            Work::Idle => None,
-        };
-        if let Some((tag, tone)) = tag {
-            let tw = font.width(tag, ROW_PX * s);
-            font.left_aligned(c, tag, text_right - tw, y, ROW_PX * s, tone, a);
+    // Header: the mark, then the title on the same line.
+    let mut title_left = text_left;
+    let msize = (HEAD_MARK * s).round().max(1.0) as u32;
+    if let Some(m) = marks.get(provider, msize) {
+        let my = (y + (HEAD_H * s - m.size as f32) / 2.0).round() as i32;
+        c.mask(&m.alpha, m.size as i32, text_left.round() as i32, my, LABEL, a);
+        title_left += m.size as f32 + 8.0 * s;
+    }
+    let title = format!("{} Usage", pretty(provider));
+    let baseline = y + HEAD_H * s * 0.5 + TITLE_PX * s * 0.36;
+    font.left_aligned(c, &title, title_left, baseline, TITLE_PX * s, LABEL, a);
+    y += HEAD_H * s + TITLE_GAP * s;
+
+    if r.rows.is_empty() {
+        y += ROW_GAP * s + ROW_PX * s;
+        font.left_aligned(c, "No reading yet", text_left, y, ROW_PX * s, MUTED, a);
+    }
+    // Rows arrive in order rather than together, each easing out on its own, and each slides the
+    // last few pixels up into place as it fades.
+    let total_rows = r.rows.len() + r.sessions.len();
+    for (n, (label, used, resets)) in r.rows.iter().enumerate() {
+        let t = stagger(f.card, n, total_rows);
+        let ra = a * t;
+        let lift = (1.0 - t) * 6.0 * s;
+        y += ROW_GAP * s + ROW_PX * s;
+        let ry = y + lift;
+        let reset = resets.map(|at| reset_copy(at, now)).unwrap_or_default();
+        let rw = if reset.is_empty() { 0.0 } else { font.width(&reset, SMALL_PX * s) };
+        let room = (inner_w - rw - 8.0 * s).max(10.0);
+        let label = font.elide(label, ROW_PX * s, room);
+        font.left_aligned(c, &label, text_left, ry, ROW_PX * s, LABEL, ra);
+        if !reset.is_empty() {
+            font.left_aligned(c, &reset, text_right - rw, ry, SMALL_PX * s, MUTED, ra);
         }
-        y += TITLE_GAP * s;
-
-        if r.rows.is_empty() {
-            y += ROW_PX * s;
-            font.left_aligned(c, "no reading", text_left, y, ROW_PX * s, MUTED, a);
+        y += BAR_GAP * s;
+        draw_bar(c, text_left, y + lift, inner_w, BAR_H * s, *used, ra);
+        y += BAR_H * s + USED_GAP * s + SMALL_PX * s;
+        if used.is_some() {
+            let copy = format!("{} Used", pct_label(*used));
+            font.left_aligned(c, &copy, text_left, y + lift, SMALL_PX * s, MUTED, ra);
         }
-        // Rows arrive in order rather than together, each easing out on its own, and each slides
-        // the last few pixels up into place as it fades.
-        let total_rows = r.rows.len() + r.sessions.len();
-        for (n, (label, used)) in r.rows.iter().enumerate() {
-            if n > 0 {
-                y += ROW_GAP * s;
-            }
-            y += ROW_PX * s;
-            // `ry` is where this row draws, `y` stays the layout cursor the loop advances.
-            let t = stagger(f.card, n, total_rows);
-            let a = a * t;
+    }
+
+    // Live sessions below the limits, under a hairline: what is running, what is waiting on you.
+    if !r.sessions.is_empty() {
+        y += 12.0 * s;
+        c.round_rect(text_left + inner_w / 2.0, y, inner_w / 2.0, 0.5 * s, 0.0, RULE, None, a);
+        y += 8.0 * s;
+        for (n, (title, what)) in r.sessions.iter().enumerate() {
+            let t = stagger(f.card, r.rows.len() + n, total_rows);
+            let ra = a * t;
+            y += SMALL_PX * s;
             let ry = y + (1.0 - t) * 6.0 * s;
-            // The percentage still sits at the end of the label line: the bar carries the shape,
-            // the number is there when the exact value matters.
-            let value = pct_label(*used);
-            let vw = font.width(&value, ROW_PX * s);
-            let room = (inner_w - vw - 10.0 * s).max(10.0);
-            let label = font.elide(label, ROW_PX * s, room);
-            font.left_aligned(c, &label, text_left, ry, ROW_PX * s, MUTED, a);
-            font.left_aligned(c, &value, text_right - vw, ry, ROW_PX * s, MUTED, a);
-            y += BAR_GAP * s;
-            draw_bar(c, text_left, ry + BAR_GAP * s, inner_w, BAR_H * s, *used, a);
-            y += BAR_H * s;
-        }
-
-        // Live sessions below the limits: what is running, and what is waiting on an answer.
-        if !r.sessions.is_empty() {
-            y += ROW_GAP * s;
-            for (n, (title, what)) in r.sessions.iter().enumerate() {
-                if n > 0 {
-                    y += ROW_GAP * 0.5 * s;
-                }
-                y += ROW_PX * s;
-                let t = stagger(f.card, r.rows.len() + n, total_rows);
-                let a = a * t;
-                let ry = y + (1.0 - t) * 6.0 * s;
-                let head = font.elide(title, ROW_PX * s, inner_w * 0.45);
-                let pen = font.left_aligned(c, &head, text_left, ry, ROW_PX * s, INK, a * 0.9);
-                let room = text_right - pen - 8.0 * s;
-                if room > 12.0 * s {
-                    let detail = font.elide(what, ROW_PX * s, room);
-                    let dw = font.width(&detail, ROW_PX * s);
-                    font.left_aligned(c, &detail, text_right - dw, ry, ROW_PX * s, MUTED, a);
-                }
+            let head = font.elide(title, SMALL_PX * s, inner_w * 0.5);
+            let pen = font.left_aligned(c, &head, text_left, ry, SMALL_PX * s, SESSION_INK, ra);
+            let room = text_right - pen - 8.0 * s;
+            if room > 12.0 * s {
+                let detail = font.elide(what, SMALL_PX * s, room);
+                let dw = font.width(&detail, SMALL_PX * s);
+                font.left_aligned(c, &detail, text_right - dw, ry, SMALL_PX * s, MUTED, ra);
             }
+            y += 4.0 * s;
         }
-
     }
 }
 
@@ -1404,13 +1457,14 @@ mod tests {
                 label: "Current session".into(),
                 used: Some(used),
                 count: None,
+                resets_at: None,
             }],
             fetched_at,
         }
     }
 
     fn reading(used: Option<f32>, work: Work) -> Reading {
-        Reading { used, stale: false, rows: vec![("Current session".into(), used)], work, sessions: Vec::new() }
+        Reading { used, stale: false, rows: vec![("Current session".into(), used, None)], work, sessions: Vec::new() }
     }
 
     // ------------------------------------------------------------ readings
@@ -1444,8 +1498,8 @@ mod tests {
         let s = Snapshot {
             status: "ok".into(),
             windows: vec![
-                Window_ { id: "session".into(), label: "Current session".into(), used: Some(0.2), count: None },
-                Window_ { id: "weekly_all".into(), label: "Weekly".into(), used: Some(0.28), count: None },
+                Window_ { id: "session".into(), label: "Current session".into(), used: Some(0.2), count: None, resets_at: None },
+                Window_ { id: "weekly_all".into(), label: "Weekly".into(), used: Some(0.28), count: None, resets_at: None },
             ],
             fetched_at: 1,
         };
@@ -1459,7 +1513,7 @@ mod tests {
     fn a_window_with_no_label_falls_back_to_its_id() {
         let s = Snapshot {
             status: "ok".into(),
-            windows: vec![Window_ { id: "primary".into(), label: String::new(), used: Some(0.1), count: None }],
+            windows: vec![Window_ { id: "primary".into(), label: String::new(), used: Some(0.1), count: None, resets_at: None }],
             fetched_at: 1,
         };
         assert_eq!(reading_of(&s, 2).rows[0].0, "primary");
@@ -1525,7 +1579,7 @@ mod tests {
         let lay = Layout::new(1.0, 1, 0.0);
         let one = reading(Some(0.2), Work::Idle);
         let mut wide = reading(Some(0.2), Work::Idle);
-        wide.rows = (0..4).map(|i| (format!("row {i}"), Some(0.1))).collect();
+        wide.rows = (0..4).map(|i| (format!("row {i}"), Some(0.1), None)).collect();
         assert!(panel_height(&lay, &wide) > panel_height(&lay, &one));
     }
 
@@ -2003,10 +2057,18 @@ mod tests {
     #[ignore]
     fn dump_the_pill() {
         use resvg::tiny_skia;
-        let lay = Layout::new(1.2, 2, 0.0);
+        let lay = Layout::new(1.2, 3, 0.0);
+        // The upstream mockup's numbers, so the dump can be held up against it.
+        let mut claude = reading(Some(0.73), Work::Idle);
+        let now = now_ms();
+        claude.rows = vec![
+            ("Current session".into(), Some(0.73), Some(now + 51 * 60_000)),
+            ("All models".into(), Some(0.07), Some(now + 3 * 86_400_000)),
+        ];
         let readings = vec![
-            ("claude", reading(Some(0.27), Work::Idle)),
-            ("codex", reading(Some(0.02), Work::Idle)),
+            ("claude", claude),
+            ("codex", reading(Some(0.21), Work::Idle)),
+            ("antigravity", reading(Some(0.52), Work::Idle)),
         ];
         // Which panel to dump comes from the environment, so both can be looked at without edits.
         let which: usize = std::env::var("DUMP_PANEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -2081,7 +2143,7 @@ largura solida (alpha>200) por linha, do topo e da base:");
         // to that here is the stutter.
         let lay = Layout::new(1.2, 2, 0.0);
         let mut big = reading(Some(0.27), Work::Running);
-        big.rows = (0..3).map(|i| (format!("Limit {i}"), Some(0.3))).collect();
+        big.rows = (0..3).map(|i| (format!("Limit {i}"), Some(0.3), None)).collect();
         big.sessions = vec![("proj".into(), "working".into()), ("outro".into(), "waiting".into())];
         let readings = vec![("claude", big), ("codex", reading(Some(0.02), Work::Idle))];
         let lay = Layout::new(1.2, 2, panels_height(&lay, &readings));

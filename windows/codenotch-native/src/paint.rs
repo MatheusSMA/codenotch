@@ -5,13 +5,15 @@
 //! Text lives in `text.rs`, rasterised from the system UI font.
 
 /// The three bands the rings share with the tray: comfortable, getting close, nearly spent.
+/// Upstream's `UsageBand`: thresholds from its mockup (21 % green, 52 % yellow, 73 % orange),
+/// colours from its `Palette`.
 pub fn band(used: f32) -> [f32; 3] {
     if used < 0.5 {
-        [0.29, 0.87, 0.50] // green  #4ade80
-    } else if used < 0.8 {
-        [0.98, 0.80, 0.08] // amber  #facc15
+        [0.0, 1.0, 0.533] // ample    #00FF88
+    } else if used < 0.7 {
+        [0.949, 1.0, 0.0] // watch    #F2FF00
     } else {
-        [0.97, 0.44, 0.44] // red    #f87171
+        [1.0, 0.247, 0.0] // critical #FF3F00
     }
 }
 
@@ -157,6 +159,41 @@ impl Canvas {
         }
     }
 
+    /// The card's tail, pointing right: `M0 0 C0 9 18.56 13.68 32 18 C18.56 22.32 0 27 0 36 Z` from
+    /// notch.html, scaled to `w` x `h`, its base at `left` and its point at (`left + w`, `cy`). The
+    /// shoulders leave the card tangent to its edge, so card and tail read as one shape.
+    pub fn tail(&mut self, left: f32, cy: f32, w: f32, h: f32, rgb: [f32; 3], alpha: f32) {
+        // Top edge as a polyline, sampled densely enough that no column is skipped.
+        let (sx, sy) = (w / 32.0, h / 36.0);
+        let bez = |t: f32| {
+            let u = 1.0 - t;
+            let x = 3.0 * u * t * t * 18.56 + t * t * t * 32.0;
+            let y = 3.0 * u * u * t * 9.0 + 3.0 * u * t * t * 13.68 + t * t * t * 18.0;
+            (x * sx, y * sy)
+        };
+        let cols = w.ceil() as usize + 1;
+        let mut top = vec![h / 2.0; cols];
+        let steps = (cols * 8).max(64);
+        for i in 0..=steps {
+            let (x, y) = bez(i as f32 / steps as f32);
+            let c = (x.floor().max(0.0) as usize).min(cols - 1);
+            top[c] = top[c].min(y);
+        }
+        let y0 = cy - h / 2.0;
+        for (c, &ty) in top.iter().enumerate() {
+            let px = (left + c as f32).floor() as i32;
+            let (a, b) = (y0 + ty, y0 + h - ty);
+            if b <= a {
+                continue;
+            }
+            for py in a.floor() as i32..b.ceil() as i32 {
+                // Vertical coverage only: the columns are a pixel wide, so this is the edge that shows.
+                let cov = ((py as f32 + 1.0).min(b) - (py as f32).max(a)).clamp(0.0, 1.0);
+                self.put(px, py, rgb, alpha * cov);
+            }
+        }
+    }
+
     /// Composite an alpha mask — a rasterised provider mark — tinted to `rgb`. The mask carries the
     /// shape, the colour comes from here, so one raster serves both the normal and the dimmed
     /// state. `ox`/`oy` are the mask's top-left corner on this canvas.
@@ -201,7 +238,9 @@ mod tests {
     fn bands_change_at_the_documented_thresholds() {
         assert_eq!(band(0.49), band(0.0));
         assert_ne!(band(0.51), band(0.49));
-        assert_ne!(band(0.81), band(0.79));
+        assert_ne!(band(0.71), band(0.69));
+        // The mockup upstream took its thresholds from: 21 % green, 52 % yellow, 73 % orange.
+        assert!(band(0.21) != band(0.52) && band(0.52) != band(0.73));
     }
 
     #[test]
