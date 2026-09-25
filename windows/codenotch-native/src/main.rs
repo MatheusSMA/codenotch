@@ -84,7 +84,11 @@ const REVEAL_REACH: f32 = PEEK;
 /// before it reaches the pill's rows and then slides along the wall, where `x` cannot grow any
 /// further — without a grace period that slide is indistinguishable from a pointer that was parked
 /// there all along, and the pill would only ever open for a push that landed on the rows exactly.
-const PUSH_GRACE: Duration = Duration::from_millis(700);
+const PUSH_GRACE: Duration = Duration::from_millis(350);
+/// How much sideways travel counts as a push rather than the wobble of a hand that has come to
+/// rest. A pointer settling near the edge still creeps a pixel at a time, and one creeping pixel
+/// used to arm the reveal.
+const PUSH_STEP: i32 = 12;
 const HOVER_PAD: f32 = 12.0;
 /// Extra room the pointer gets before the pill decides it has left. Without it a single threshold
 /// plus an unsteady hand is a switch being flicked: a pointer resting near the edge crosses it
@@ -112,13 +116,25 @@ pub(crate) fn trace(line: &str) {
     if std::env::var_os("CODENOTCH_TRACE").is_none() {
         return;
     }
+    log_line(line);
+}
+
+/// The handful of lines that are written whether tracing is on or not: starting up, and every way
+/// of not starting up. Without them a pill that is simply absent leaves nothing behind to read, and
+/// the next question about it can only be answered by guessing.
+pub(crate) fn log_line(line: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(std::env::temp_dir().join("codenotch-native.log"))
     {
-        let _ = writeln!(f, "{line}");
+        let stamp = std::time::SystemTime::now();
+        let secs = stamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{secs}] {line}");
     }
 }
 
@@ -941,9 +957,18 @@ fn main() {
         // The hook spawns this binary whenever its POST cannot connect — including while the first
         // one is still booting — so without this the machine collects pills that never hear an
         // event and shadow the real one at the edge.
+        // A lost bind is not proof of a live pill. The port can also be held by a socket nobody
+        // owns any more, and exiting on that leaves the machine with no pill at all until a reboot
+        // — worse than the zombie this guard is here to prevent. So ask whoever holds it whether
+        // they are answering; only a reply means a real instance is already up.
         if !owns_hooks {
-            trace("second instance: the hook port is taken, leaving");
-            return;
+            if hooks::port_answers(HOOK_PORT) {
+                log_line("second instance: another pill answers on the hook port, leaving");
+                return;
+            }
+            log_line("hook port is held but nobody answers: carrying on without hook events");
+        } else {
+            log_line("start: hook port taken, this is the pill");
         }
         // Wire Claude Code's hooks at startup if they are not already pointing here. Without them
         // nothing posts to the port above, and `attention` can never fire: it is the one state with
@@ -1120,7 +1145,7 @@ fn main() {
             let at_edge = (cur.x as f32) >= reveal_edge;
             if !at_edge {
                 pushed_at = None;
-            } else if cur.x > prev_x {
+            } else if cur.x.saturating_sub(prev_x) >= PUSH_STEP {
                 pushed_at = Some(Instant::now());
             }
             let pushed_out = in_rows && pushed_at.is_some_and(|t| t.elapsed() < PUSH_GRACE);
@@ -1904,7 +1929,7 @@ mod tests {
     ) -> (Option<Instant>, bool) {
         let armed = if cur_x < reveal_edge {
             None
-        } else if cur_x > prev_x {
+        } else if cur_x.saturating_sub(prev_x) >= PUSH_STEP {
             Some(Instant::now())
         } else {
             armed
@@ -1933,6 +1958,8 @@ mod tests {
         assert!(!push_step(None, 3439, 3425, EDGE, true).1, "moving inwards must not open it");
         // First frame, before there is a previous position to compare against.
         assert!(!push_step(None, i32::MAX, 3425, EDGE, true).1, "startup must not open it");
+        // A hand coming to rest creeps a pixel at a time; that is not a push.
+        assert!(!push_step(None, 3424, 3425, EDGE, true).1, "a one pixel creep must not open it");
     }
 
     #[test]

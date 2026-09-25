@@ -86,6 +86,30 @@ pub fn start(hub: Arc<Hub>, port: u16) -> bool {
     true
 }
 
+/// Whether a live instance is answering on the hook port. A failed bind alone does not say that:
+/// a socket left behind by a process that is gone holds the port just as well, and treating that as
+/// "another pill is running" would leave the machine with none.
+pub fn port_answers(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let addr = format!("127.0.0.1:{port}");
+    let Ok(addr) = addr.parse() else { return false };
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(400)));
+    let req = format!("GET /ping HTTP/1.1
+Host: 127.0.0.1:{port}
+Connection: close
+
+");
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    matches!(s.read(&mut buf), Ok(n) if n > 0)
+}
+
 fn query_param(url: &str, key: &str) -> String {
     let q = url.split_once('?').map(|x| x.1).unwrap_or("");
     for pair in q.split('&') {
