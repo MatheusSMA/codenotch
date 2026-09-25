@@ -97,6 +97,9 @@ const TAIL_H: f32 = px(87.0);
 const TAIL_GAP: f32 = px(28.0);
 /// Card's right edge to the pill's left edge: the tail plus the air past its tip.
 const CARD_GAP: f32 = TAIL_W + TAIL_GAP;
+/// The card is drawn this much larger than the frame's numbers: at the frame's own size its 9.5 pt
+/// body text was too small to read comfortably on a desktop monitor.
+const CARD_ZOOM: f32 = 1.4;
 /// Breathing room to the left of the panel, so its rounded corner is not clipped by the canvas.
 const CARD_MARGIN: f32 = 10.0;
 /// `Typography.cardTitle`, semibold, and `cardBody`, regular.
@@ -544,13 +547,13 @@ impl Layout {
         // one fillet radius above and below.
         let pill_block = pill_h + FILLET * 2.0 * scale;
         let h = pill_block.max(panels_h);
-        let w = CARD_MARGIN + CARD_W + CARD_GAP + PILL_W;
+        let w = CARD_MARGIN + (CARD_W + CARD_GAP) * CARD_ZOOM + PILL_W;
         Layout {
             scale,
             // Up, not to nearest: the pill is fractional in design units and must never lose a column.
             w: (w * scale).ceil() as i32,
             h: h.round() as i32,
-            pill_left: (CARD_MARGIN + CARD_W + CARD_GAP) * scale,
+            pill_left: (CARD_MARGIN + (CARD_W + CARD_GAP) * CARD_ZOOM) * scale,
             // Both rounded. With a fractional height the top edge lands on one subpixel phase and
             // the bottom on another, and the two fillets come out visibly different shapes.
             pill_top: ((h - pill_h) / 2.0).round(),
@@ -725,7 +728,7 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text, body: &
 
 /// Height one provider's panel needs, in scaled pixels.
 fn panel_height(lay: &Layout, r: &Reading) -> f32 {
-    let s = lay.scale;
+    let s = lay.scale * CARD_ZOOM;
     let rows = r.rows.len().max(1) as f32;
     let body = line(BODY_PX);
     let mut h = CARD_PAD * 2.0 + MARK.max(line(TITLE_PX)) + HEADER_TO_BLOCK;
@@ -788,7 +791,9 @@ fn reset_copy(resets_at_ms: i64, now_ms: i64) -> String {
 /// and "<Name> Usage", then one block per limit (label and reset time, a thin bar, "n% Used") and
 /// a curved tail whose point sits on the ring that opened it.
 fn draw_panels(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text, body: &mut Text) {
-    let (lay, s) = (f.lay, f.lay.scale);
+    let (lay, ps) = (f.lay, f.lay.scale);
+    // `ps` places things against the pill, `s` sizes the card itself.
+    let s = ps * CARD_ZOOM;
     let Some(idx) = f.panel else { return };
     let Some((provider, r)) = f.readings.get(idx) else { return };
     let w = CARD_W * s;
@@ -802,7 +807,7 @@ fn draw_panels(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text, bo
 
     let h = panel_height(lay, r);
     // Centred on its own ring rather than on the window: the panel points at what opened it.
-    let ring_mid = lay.pill_top + PAD_Y * s + idx as f32 * (lay.cell_h + GAP) * s + RING_BOX / 2.0 * s;
+    let ring_mid = lay.pill_top + PAD_Y * ps + idx as f32 * (lay.cell_h + GAP) * ps + RING_BOX / 2.0 * ps;
     let top = (ring_mid - h / 2.0).clamp(0.0, (lay.h as f32 - h).max(0.0));
     c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, None, a);
     // The tail overlaps the card by a pixel so the two read as one shape; its tip stops
@@ -1685,7 +1690,7 @@ mod tests {
         // It used to start at exactly x=0, so its rounded corner and hairline were cut off by the
         // canvas. The window has to be wider than panel plus gap plus pill.
         let lay = Layout::new(1.0, 2, 0.0);
-        let panel_left = lay.pill_left - CARD_GAP - CARD_W;
+        let panel_left = lay.pill_left - (CARD_GAP + CARD_W) * CARD_ZOOM;
         assert!(panel_left >= 4.0, "the panel starts at {panel_left}, flush with the edge");
         assert!((lay.w as f32) - lay.pill_left >= PILL_W, "and the pill still fits");
     }
