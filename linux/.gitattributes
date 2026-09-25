@@ -1,0 +1,3 @@
+# Everything here runs on Linux: a CRLF shebang line breaks install.sh.
+* text=auto eol=lf
+*.svg binary

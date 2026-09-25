@@ -544,6 +544,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codenotch-daemon"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs 5.0.1",
+ "native-tls",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "ureq",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "codenotch-hook"
 version = "0.3.0"
 

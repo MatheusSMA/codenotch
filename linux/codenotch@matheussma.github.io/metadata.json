@@ -1,0 +1,7 @@
+{
+  "uuid": "codenotch@matheussma.github.io",
+  "name": "Codenotch",
+  "description": "Your AI coding limits (Claude, Codex, Cursor, Antigravity) as rings in a pill on the right edge of the screen. Needs the codenotch-daemon service from the same repository.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/MatheusSMA/codenotch"
+}

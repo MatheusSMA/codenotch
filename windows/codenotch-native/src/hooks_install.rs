@@ -76,7 +76,7 @@ pub fn install() -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .parent()
         .ok_or("cannot locate the program directory")?
-        .join("codenotch-hook.exe");
+        .join(format!("codenotch-hook{}", std::env::consts::EXE_SUFFIX));
     if !hook_exe.exists() {
         return Err(format!("missing {}", hook_exe.display()));
     }

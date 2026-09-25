@@ -20,7 +20,7 @@ use std::os::windows::ffi::OsStrExt;
 /// Checks `%LOCALAPPDATA%\agy\bin\agy.exe` and `PATH` only (only `.exe` binaries).
 pub fn find_agy() -> Option<PathBuf> {
     if let Some(local) = dirs::data_local_dir() {
-        let candidate = local.join("agy").join("bin").join("agy.exe");
+        let candidate = local.join("agy").join("bin").join(format!("agy{}", std::env::consts::EXE_SUFFIX));
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -34,7 +34,7 @@ pub fn find_agy() -> Option<PathBuf> {
 /// Helper for testing discovery in explicit directories without touching environment.
 fn find_agy_in(dirs: &[PathBuf]) -> Option<PathBuf> {
     for dir in dirs {
-        let candidate = dir.join("agy.exe");
+        let candidate = dir.join(format!("agy{}", std::env::consts::EXE_SUFFIX));
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -201,6 +201,7 @@ pub fn save_persisted_to(dest: &Path, snap: &UsageSnapshot) -> std::io::Result<(
 }
 
 /// Quotes a command line argument according to Windows CommandLineToArgvW rules.
+#[cfg(windows)]
 fn quote_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
@@ -506,6 +507,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn quoted_paths_keep_backslashes() {
         assert_eq!(quote_arg(r"C:\Program Files\agy.exe"), r#""C:\Program Files\agy.exe""#);
         assert_eq!(quote_arg("path with space\\"), "\"path with space\\\\\"");
