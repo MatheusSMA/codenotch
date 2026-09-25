@@ -24,6 +24,9 @@ pub struct Hub {
     pub usage: Mutex<UsageSnapshot>,
     /// The same for Codex, which shares the snapshot shape.
     pub codex: Mutex<UsageSnapshot>,
+    /// And Cursor and Antigravity, ported from the Tauri build.
+    pub cursor: Mutex<UsageSnapshot>,
+    pub antigravity: Mutex<UsageSnapshot>,
     changed: AtomicBool,
 }
 

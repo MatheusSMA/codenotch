@@ -12,7 +12,10 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod activity;
+mod agy_cli;
+mod antigravity;
 mod codex;
+mod cursor;
 mod glyphs;
 mod hooks;
 mod hooks_install;
@@ -407,13 +410,12 @@ impl Cfg {
 
     /// An empty slot list means every provider, which is the rule notch.html documents.
     fn providers(&self) -> Vec<&'static str> {
-        let known = ["claude", "codex", "cursor", "antigravity"];
         if self.notch_slots.is_empty() {
-            return known.to_vec();
+            return KNOWN.to_vec();
         }
         self.notch_slots
             .iter()
-            .filter_map(|s| known.iter().find(|k| **k == s.provider).copied())
+            .filter_map(|s| KNOWN.iter().find(|k| **k == s.provider).copied())
             .collect()
     }
 }
@@ -917,6 +919,37 @@ unsafe fn set_click_through(hwnd: HWND, on: bool) {
 /// itself: the way to pick up a new build, and the way to stop it.
 const MENU_RESTART: usize = 1;
 const MENU_QUIT: usize = 2;
+/// One menu id per provider, `MENU_PROVIDER + index into KNOWN`.
+const MENU_PROVIDER: usize = 100;
+
+/// Every provider the pill can show, in the order it stacks them.
+const KNOWN: [&str; 4] = ["claude", "codex", "cursor", "antigravity"];
+
+/// The configurator: turns one provider on or off in `config.json` and keeps every other key the
+/// file holds, since the Tauri build wrote plenty this binary does not read. Refuses to switch the
+/// last one off, which would leave a pill with nothing in it and no ring to right-click.
+fn toggle_provider(on_now: &[&str], which: &str) -> bool {
+    let mut next: Vec<&str> = KNOWN
+        .iter()
+        .copied()
+        .filter(|p| if *p == which { !on_now.contains(p) } else { on_now.contains(p) })
+        .collect();
+    if next.is_empty() {
+        return false;
+    }
+    next.dedup();
+    let path = data_dir().join("config.json");
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let slots: Vec<_> = next.iter().map(|p| serde_json::json!({ "provider": p })).collect();
+    v["notch_slots"] = serde_json::Value::Array(slots);
+    v["notch_providers"] = serde_json::json!(next);
+    let _ = std::fs::create_dir_all(data_dir());
+    // serde writes no BOM, which is the point: a BOM makes serde reject the file on the next read.
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok()
+}
 
 /// Opens it at the pointer and returns what was picked, or 0 if it was dismissed.
 ///
@@ -925,8 +958,16 @@ const MENU_QUIT: usize = 2;
 /// `WS_EX_NOACTIVATE` precisely so that hovering the pill never steals focus — so the style comes
 /// off for as long as the menu is up and goes straight back on. Right-aligned because the pill sits
 /// against the right edge of the screen, where a left-aligned menu would open off it.
-unsafe fn pill_menu(hwnd: HWND, at: POINT) -> usize {
+unsafe fn pill_menu(hwnd: HWND, at: POINT, shown: &[&str]) -> usize {
     let Ok(menu) = CreatePopupMenu() else { return 0 };
+    // The configurator: one checkable line per AI. Ticking adds its ring, unticking removes it.
+    let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("AIs on the pill"));
+    for (i, p) in KNOWN.iter().enumerate() {
+        let flags = if shown.contains(p) { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let name: Vec<u16> = pretty(p).encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = AppendMenuW(menu, flags, MENU_PROVIDER + i, PCWSTR(name.as_ptr()));
+    }
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_RESTART, w!("Restart"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit"));
@@ -1038,6 +1079,12 @@ fn main() {
         usage::start(hub.clone());
         hub.codex.lock().map(|mut u| *u = codex::load_persisted()).ok();
         codex::start(hub.clone());
+        hub.cursor.lock().map(|mut u| *u = cursor::load_persisted()).ok();
+        cursor::start(hub.clone());
+        hub.antigravity.lock().map(|mut u| *u = antigravity::load_persisted()).ok();
+        antigravity::start(hub.clone());
+        // The Antigravity CLI path reads only on request (each read spawns the CLI); ask once now.
+        antigravity::request_refresh();
         // Stale session cleanup, on the same 30 s beat the Tauri build uses. Without it the table
         // only ever grows: a running session never falls back to idle, a finished one is never
         // removed, and a session stuck on attention paints the ring amber for ever.
@@ -1241,7 +1288,7 @@ fn main() {
             // frame that comes back afterwards cannot launch the springs across the screen.
             let right = GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
             if right && !was_right && over_pill && shown {
-                match pill_menu(hwnd, cur) {
+                match pill_menu(hwnd, cur, &providers) {
                     MENU_RESTART => {
                         // The outgoing process still holds the hook port for a moment; the new one
                         // retries the bind rather than starting up deaf to events.
@@ -1251,6 +1298,16 @@ fn main() {
                         std::process::exit(0);
                     }
                     MENU_QUIT => std::process::exit(0),
+                    // A provider was ticked or unticked. The layout is sized for the ring count at
+                    // startup, so the cheapest correct way to apply it is the same restart as above.
+                    id if (MENU_PROVIDER..MENU_PROVIDER + KNOWN.len()).contains(&id) => {
+                        if toggle_provider(&providers, KNOWN[id - MENU_PROVIDER]) {
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(exe).spawn();
+                            }
+                            std::process::exit(0);
+                        }
+                    }
                     _ => {}
                 }
                 // Both buttons may still be down on the way back, and a stale edge here would open
@@ -1270,6 +1327,12 @@ fn main() {
                 // the target further down, once per frame. A reversal therefore keeps the momentum
                 // it already had.
                 shown = want;
+                // Opening is when someone is about to read the numbers: refresh the two providers
+                // that do not poll on their own (each Antigravity read spawns its CLI).
+                if shown {
+                    antigravity::request_hover_refresh();
+                    cursor::request_refresh();
+                }
             }
             // Leaving closes the panel too: it must not be left hanging open off the edge.
             if !shown && panel_want.is_some() {

@@ -556,6 +556,7 @@ dependencies = [
  "dirs 5.0.1",
  "native-tls",
  "resvg",
+ "rusqlite",
  "serde",
  "serde_json",
  "tiny_http",
