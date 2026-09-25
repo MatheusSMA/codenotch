@@ -41,7 +41,16 @@ struct Glyph {
 
 impl Text {
     pub fn system() -> Option<Text> {
-        for path in CANDIDATES {
+        Self::first_of(&CANDIDATES)
+    }
+
+    /// Segoe UI Regular, for the card's body text (`Typography.cardBody` is `.regular`).
+    pub fn regular() -> Option<Text> {
+        Self::first_of(&CANDIDATES[1..])
+    }
+
+    fn first_of(paths: &[&str]) -> Option<Text> {
+        for path in paths.iter().copied() {
             let Ok(bytes) = std::fs::read(path) else { continue };
             if let Ok(font) = FontVec::try_from_vec(bytes) {
                 return Some(Text { font, cache: HashMap::new() });
@@ -57,7 +66,11 @@ impl Text {
         if let Some(g) = self.cache.get(&key) {
             return g.clone();
         }
-        let size = key.1 as f32;
+        // `px` is an em size, as CSS and SwiftUI mean it. ab_glyph's scale is the height of the
+        // font's ascent-to-descent box instead, which for Segoe UI is 1.33 em: passing the em size
+        // straight through drew every string at three quarters of the size asked for.
+        let em = self.font.units_per_em().unwrap_or(1.0);
+        let size = key.1 as f32 * self.font.height_unscaled() / em;
         let scaled = self.font.as_scaled(size);
         let id = self.font.glyph_id(ch);
         let advance = scaled.h_advance(id);

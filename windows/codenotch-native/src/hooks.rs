@@ -101,11 +101,7 @@ pub fn port_answers(port: u16) -> bool {
         return false;
     };
     let _ = s.set_read_timeout(Some(Duration::from_millis(400)));
-    let req = format!("GET /ping HTTP/1.1
-Host: 127.0.0.1:{port}
-Connection: close
-
-");
+    let req = format!("GET /ping HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     if s.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -254,6 +250,17 @@ pub(crate) fn is_allowed_origin(origin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_live_server_answers_the_probe_and_a_free_port_does_not() {
+        // The single-instance guard exits only when this says yes. It said no to a live pill once,
+        // because the request's line breaks were bare LF and tiny_http never parsed it: two pills.
+        let hub = std::sync::Arc::new(Hub::default());
+        let port = 48790;
+        assert!(!port_answers(port), "nothing listens yet");
+        assert!(start(hub, port));
+        assert!(port_answers(port), "a running pill must answer");
+    }
     use super::*;
 
     #[test]

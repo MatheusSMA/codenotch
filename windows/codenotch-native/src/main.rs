@@ -41,52 +41,75 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, 
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ---------------------------------------------------------------- design sizes
-// Design pixels, matching notch.html so the two builds line up side by side. Everything is
-// multiplied by the config's `scale` and the monitor's before it reaches the screen.
-const PILL_W: f32 = 70.0;
-const PAD_Y: f32 = 18.0;
-const GAP: f32 = 14.0;
-const RING_BOX: f32 = 56.0;
-const TEXT_GAP: f32 = 6.0;
-const RADIUS: f32 = 20.0;
-/// Size of the percentage under each ring, from `.pct{font-size:15px}` in notch.html.
-const PCT_PX: f32 = 15.0;
-/// Side of the provider mark inside the ring, from `.glyph .mark` in notch.html.
-const MARK: f32 = 26.0;
-/// Radius of the concave arcs above and below the pill, from `--fillet` in notch.html.
-const FILLET: f32 = 26.0;
+// Upstream's design frame, `docs/design/frame-124-hover-tooltip.png`, as its `NotchLayout.swift`
+// quotes it: frame pixels times 44/117 (the 44 pt ring is the anchor). Kept in frame pixels here so
+// every number can be checked against that file; `px` does the conversion.
+const fn px(frame: f32) -> f32 {
+    frame * 44.0 / 117.0
+}
+/// Point size whose capitals are `cap` frame pixels tall (SF Pro's cap height is 0.714 em).
+const fn cap(frame: f32) -> f32 {
+    px(frame) / 0.714
+}
+/// Line box of a font of size `size`, SF's ascender minus descender (0.952 + 0.241 em), rounded up.
+fn line(size: f32) -> f32 {
+    (size * 1.193).ceil()
+}
+/// Baseline inside a line box that starts at `top`.
+fn baseline_in(top: f32, size: f32) -> f32 {
+    top + size * 0.952 + (line(size) - size * 1.193) / 2.0
+}
 
-// The detail panel, to the left of the pill, one provider at a time. Sizes are notch.html's `#card`,
-// which reproduces the upstream design frame: 246 wide, 16 padding, 12/11 px type, a 4 px bar.
-const CARD_W: f32 = 246.0;
-/// Space between the card and the pill, spanned by the tail. notch.html puts the card's right edge
-/// 100 px from the window's and the pill is 70 wide.
-const CARD_GAP: f32 = 30.0;
-/// The tail: the curved wedge from `#tail` in notch.html, its point on the ring that opened it.
-const TAIL_W: f32 = 32.0;
-const TAIL_H: f32 = 36.0;
-/// Breathing room to the left of the panel. Without it the window was exactly wide enough for
-/// panel + gap + pill, so the panel started at x=0 and its own rounded corner and hairline were
-/// clipped off by the edge of the canvas.
+const PILL_W: f32 = px(186.0);
+/// `cornerRadius`.
+const RADIUS: f32 = px(78.8);
+/// `curlRadius`: the concave flares above and below the body.
+const FILLET: f32 = px(103.0);
+/// `padTop`, body top to the first ring, and `padBottom`, last label to body bottom.
+const PAD_Y: f32 = px(69.5);
+const PAD_BOTTOM: f32 = px(50.1);
+/// `cellSpacing`: one label's bottom to the next ring's top.
+const GAP: f32 = px(83.5);
+/// `ringDiameter`, the track's outer edge.
+const RING_BOX: f32 = px(117.0);
+const TRACK_STROKE: f32 = px(15.5);
+/// The usage arc rides the track's centre line, thinner than it, with round ends.
+const PROGRESS_STROKE: f32 = px(8.0);
+/// The working indicator, between the glyph and the track's inner edge.
+const ACTIVITY_D: f32 = px(72.0);
+const ACTIVITY_STROKE: f32 = px(5.5);
+/// `ringLabelGap`: ring bottom to the top of the percent's line box.
+const TEXT_GAP: f32 = px(26.9);
+/// `Typography.percent`, semibold.
+const PCT_PX: f32 = cap(27.0);
+/// `glyphSize`, the provider mark inside the ring and in the card's header.
+const MARK: f32 = px(46.0);
+
+// The hover card, to the left of the pill, one provider at a time.
+const CARD_W: f32 = px(600.0);
+const CARD_RADIUS: f32 = px(49.5);
+const CARD_PAD: f32 = px(32.0);
+/// The tail: `tailLength` long, `tailHeight` tall, its tip `tailGap` short of the pill.
+const TAIL_W: f32 = px(75.0);
+const TAIL_H: f32 = px(87.0);
+const TAIL_GAP: f32 = px(28.0);
+/// Card's right edge to the pill's left edge: the tail plus the air past its tip.
+const CARD_GAP: f32 = TAIL_W + TAIL_GAP;
+/// Breathing room to the left of the panel, so its rounded corner is not clipped by the canvas.
 const CARD_MARGIN: f32 = 10.0;
-const CARD_PAD: f32 = 16.0;
-const CARD_RADIUS: f32 = 16.0;
-/// `.c-title` and the mark beside it (`.c-head .mark`).
-const TITLE_PX: f32 = 14.0;
-const HEAD_MARK: f32 = 16.0;
-const HEAD_H: f32 = 16.0;
-/// `.c-head{margin-bottom:4px}` plus the first `.win{margin-top:10px}` is carried by ROW_GAP.
-const TITLE_GAP: f32 = 4.0;
-/// `.w-label`, 12 px.
-const ROW_PX: f32 = 12.0;
-/// `.w-reset` and `.w-used`, 11 px.
-const SMALL_PX: f32 = 11.0;
-/// `.win{margin-top:10px}`.
-const ROW_GAP: f32 = 10.0;
-/// `.w-track{height:4px;margin:6px 0 4px}`.
-const BAR_H: f32 = 4.0;
-const BAR_GAP: f32 = 6.0;
-const USED_GAP: f32 = 4.0;
+/// `Typography.cardTitle`, semibold, and `cardBody`, regular.
+const TITLE_PX: f32 = cap(26.0);
+const BODY_PX: f32 = cap(18.0);
+/// `headerGap`, glyph to title; `headerToBlock`; `labelToBar`; `barToUsed`; `blockSpacing`.
+const HEADER_GAP: f32 = px(17.0);
+const HEADER_TO_BLOCK: f32 = px(21.0);
+const LABEL_TO_BAR: f32 = px(16.8);
+const BAR_TO_USED: f32 = px(17.8);
+const BLOCK_SPACING: f32 = px(20.0);
+const BAR_H: f32 = px(10.5);
+/// `hairline` above the session list, and `sessionRowGap`.
+const HAIRLINE: f32 = px(2.5);
+const SESSION_GAP: f32 = px(10.0);
 
 const PEEK: f32 = 6.0; // how much stays on screen when tucked away
 /// How far in from the edge the push that opens the pill is still read as a push. It is deliberately
@@ -205,24 +228,20 @@ const CONTENT_MIN_SCALE: f32 = 0.93;
 
 /// Pure white. notch.html uses #e8e8ea, which next to a black pill reads as grey.
 const INK: [f32; 3] = [1.0, 1.0, 1.0];
-/// `.w-label` and the card's title, #e8e8ea.
-const LABEL: [f32; 3] = [0.91, 0.91, 0.918];
-/// `.w-reset` / `.w-used`, #808080.
+/// `Palette.textSecondary`, #808080: reset times and anything quieter than the reading itself.
 const MUTED: [f32; 3] = [0.502, 0.502, 0.502];
-/// `.s-row`, #b0b0b3.
-const SESSION_INK: [f32; 3] = [0.69, 0.69, 0.702];
 /// Waiting borrows the warning yellow, #F2FF00, as `.arc-pulse` does in notch.html.
 const WATCH: [f32; 3] = [0.949, 1.0, 0.0];
 const PILL_BG: [f32; 3] = [0.0, 0.0, 0.0];
-const CARD_BG: [f32; 3] = [0.04, 0.04, 0.04];
+/// `Palette.card`: pure black, like the notch.
+const CARD_BG: [f32; 3] = [0.0, 0.0, 0.0];
 const PILL_EDGE: [f32; 3] = [0.18, 0.18, 0.18];
 /// Ring track, #303030.
 const TRACK: [f32; 3] = [0.188, 0.188, 0.188];
 /// `.w-track`, #2d2d2d.
 const BAR_TRACK: [f32; 3] = [0.176, 0.176, 0.176];
-/// `.c-sessions{border-top:1px solid #1e1e1e}`.
+/// Rule above the session list.
 const RULE: [f32; 3] = [0.118, 0.118, 0.118];
-const DISC: [f32; 3] = [0.165, 0.165, 0.165];
 
 // ---------------------------------------------------------------- persisted data
 
@@ -517,16 +536,17 @@ impl Layout {
     /// cover whichever is taller, the pill or the panels, or the panels would be clipped.
     fn new(scale: f32, cells: usize, panels_h: f32) -> Layout {
         let cells = cells.max(1) as f32;
-        let cell_h = RING_BOX + TEXT_GAP + PCT_PX;
-        let pill_h = (PAD_Y * 2.0 + cells * cell_h + (cells - 1.0) * GAP) * scale;
+        let cell_h = RING_BOX + TEXT_GAP + line(PCT_PX);
+        let pill_h = (PAD_Y + PAD_BOTTOM + cells * cell_h + (cells - 1.0) * GAP) * scale;
         // The fillets live outside the pill at both ends, so the window is taller than the pill by
         // one fillet radius above and below.
         let pill_block = pill_h + FILLET * 2.0 * scale;
         let h = pill_block.max(panels_h);
-        let w = CARD_MARGIN + CARD_W + CARD_GAP + PILL_W + 4.0;
+        let w = CARD_MARGIN + CARD_W + CARD_GAP + PILL_W;
         Layout {
             scale,
-            w: (w * scale).round() as i32,
+            // Up, not to nearest: the pill is fractional in design units and must never lose a column.
+            w: (w * scale).ceil() as i32,
             h: h.round() as i32,
             pill_left: (CARD_MARGIN + CARD_W + CARD_GAP) * scale,
             // Both rounded. With a fractional height the top edge lands on one subpixel phase and
@@ -627,7 +647,7 @@ struct Frame<'a> {
     t: f32,
 }
 
-fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
+fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text, body: &mut Text) {
     c.clear();
     let (lay, s) = (f.lay, f.lay.scale);
     let cx = lay.w as f32 - (PILL_W / 2.0) * s;
@@ -635,7 +655,7 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
     let toward_mid = |y: f32| mid + (y - mid) * f.cs;
 
     if f.card > 0.01 {
-        draw_panels(c, f, marks, font);
+        draw_panels(c, f, marks, font, body);
     }
 
     // The pill body, pushed right by its radius so only the left corners round, as on screen.
@@ -662,12 +682,12 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
         let ring_cy = toward_mid(top + (RING_BOX / 2.0) * s);
         // A reading that is merely old still shows, at the same .55 the web build dims it to
         let a = if r.stale { 0.55 } else { 1.0 };
-        c.arc(cx, ring_cy, 11.0 * s * f.cs, 22.0 * s * f.cs, DISC, 1.0, 0.0, 1.0);
-        c.arc(cx, ring_cy, 25.0 * s * f.cs, 5.0 * s * f.cs, TRACK, 1.0, 0.0, 1.0);
+        let track_r = (RING_BOX - TRACK_STROKE) / 2.0 * s * f.cs;
+        c.arc(cx, ring_cy, track_r, TRACK_STROKE * s * f.cs, TRACK, 1.0, 0.0, 1.0);
         if let Some(u) = r.used {
             let frac = u.clamp(0.0, 1.0);
             if frac > 0.0 {
-                c.arc(cx, ring_cy, 25.0 * s * f.cs, 5.0 * s * f.cs, band(u), a, 0.0, frac);
+                c.arc_capped(cx, ring_cy, track_r, PROGRESS_STROKE * s * f.cs, band(u), a, 0.0, frac);
             }
         }
 
@@ -677,11 +697,13 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
         match r.work {
             Work::Running => {
                 let turn = (f.t / SPIN_PERIOD).fract();
-                c.arc(cx, ring_cy, 19.0 * s * f.cs, 2.5 * s * f.cs, INK, 0.95, turn, turn + 0.28);
+                let r = (ACTIVITY_D - ACTIVITY_STROKE) / 2.0 * s * f.cs;
+                c.arc(cx, ring_cy, r, ACTIVITY_STROKE * s * f.cs, INK, 0.95, turn, turn + 0.28);
             }
             Work::Attention => {
                 let phase = (f.t / PULSE_PERIOD * std::f32::consts::TAU).sin() * 0.5 + 0.5;
-                c.arc(cx, ring_cy, 19.0 * s * f.cs, 2.5 * s * f.cs, WATCH, 0.25 + 0.75 * phase, 0.0, 1.0);
+                let r = (ACTIVITY_D - ACTIVITY_STROKE) / 2.0 * s * f.cs;
+                c.arc(cx, ring_cy, r, ACTIVITY_STROKE * s * f.cs, WATCH, 0.25 + 0.75 * phase, 0.0, 1.0);
             }
             Work::Idle => {}
         }
@@ -693,7 +715,7 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
         }
 
         // Baseline rather than top edge: that is the line real type sits on.
-        let baseline = toward_mid(top + (RING_BOX + TEXT_GAP) * s + lay.pct_px);
+        let baseline = toward_mid(baseline_in(top + (RING_BOX + TEXT_GAP) * s, lay.pct_px));
         font.centred(c, &pct_label(r.used), cx, baseline, lay.pct_px, INK, a);
         top += (lay.cell_h + GAP) * s;
     }
@@ -703,16 +725,15 @@ fn render(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
 fn panel_height(lay: &Layout, r: &Reading) -> f32 {
     let s = lay.scale;
     let rows = r.rows.len().max(1) as f32;
-    let mut h = CARD_PAD * 2.0 * s;
-    h += HEAD_H * s + TITLE_GAP * s;
-    // Each limit: the label line, the bar, and the "n% Used" line under it.
-    h += rows * (ROW_GAP + ROW_PX + BAR_GAP + BAR_H + USED_GAP + SMALL_PX) * s;
+    let body = line(BODY_PX);
+    let mut h = CARD_PAD * 2.0 + MARK.max(line(TITLE_PX)) + HEADER_TO_BLOCK;
+    // Each limit: the label row, the bar, the "n% Used" row; blocks apart by `blockSpacing`.
+    h += rows * (body + LABEL_TO_BAR + BAR_H + BAR_TO_USED + body) + (rows - 1.0) * BLOCK_SPACING;
     if !r.sessions.is_empty() {
-        // `.c-sessions{margin-top:12px;padding-top:8px}`, then one 11 px row each.
-        h += (12.0 + 8.0) * s;
-        h += r.sessions.len() as f32 * (SMALL_PX + 4.0) * s;
+        h += BLOCK_SPACING + HAIRLINE + BLOCK_SPACING;
+        h += r.sessions.len() as f32 * body + (r.sessions.len() as f32 - 1.0) * SESSION_GAP;
     }
-    h
+    h * s
 }
 
 /// The tallest a single panel can get, so the window is big enough whichever ring is clicked.
@@ -764,7 +785,7 @@ fn reset_copy(resets_at_ms: i64, now_ms: i64) -> String {
 /// The panel of whichever ring was clicked, drawn as upstream's tooltip card: the provider's mark
 /// and "<Name> Usage", then one block per limit (label and reset time, a thin bar, "n% Used") and
 /// a curved tail whose point sits on the ring that opened it.
-fn draw_panels(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
+fn draw_panels(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text, body: &mut Text) {
     let (lay, s) = (f.lay, f.lay.scale);
     let Some(idx) = f.panel else { return };
     let Some((provider, r)) = f.readings.get(idx) else { return };
@@ -774,82 +795,91 @@ fn draw_panels(c: &mut Canvas, f: &Frame, marks: &mut Marks, font: &mut Text) {
     let left = lay.pill_left - CARD_GAP * s - w + slide;
     let a = f.card;
     let now = now_ms();
+    let (title_px, body_px) = (TITLE_PX * s, BODY_PX * s);
+    let body_line = line(BODY_PX) * s;
 
     let h = panel_height(lay, r);
     // Centred on its own ring rather than on the window: the panel points at what opened it.
     let ring_mid = lay.pill_top + PAD_Y * s + idx as f32 * (lay.cell_h + GAP) * s + RING_BOX / 2.0 * s;
     let top = (ring_mid - h / 2.0).clamp(0.0, (lay.h as f32 - h).max(0.0));
     c.round_rect(left + w / 2.0, top + h / 2.0, w / 2.0, h / 2.0, CARD_RADIUS * s, CARD_BG, None, a);
-    // The tail spans the gap, overlapping the card by a pixel so the two read as one shape.
-    c.tail(left + w - 1.0 * s, ring_mid, TAIL_W * s, TAIL_H * s, CARD_BG, a);
+    // The tail overlaps the card by a pixel so the two read as one shape; its tip stops
+    // `tailGap` short of the pill.
+    c.tail(left + w - 1.0 * s, ring_mid, TAIL_W * s + 1.0 * s, TAIL_H * s, CARD_BG, a);
 
     let text_left = left + CARD_PAD * s;
     let text_right = left + w - CARD_PAD * s;
     let inner_w = text_right - text_left;
     let mut y = top + CARD_PAD * s;
 
-    // Header: the mark, then the title on the same line.
+    // Header: the mark, `headerGap`, then the title, centred on one line.
+    let head_h = MARK.max(line(TITLE_PX)) * s;
     let mut title_left = text_left;
-    let msize = (HEAD_MARK * s).round().max(1.0) as u32;
+    let msize = (MARK * s).round().max(1.0) as u32;
     if let Some(m) = marks.get(provider, msize) {
-        let my = (y + (HEAD_H * s - m.size as f32) / 2.0).round() as i32;
-        c.mask(&m.alpha, m.size as i32, text_left.round() as i32, my, LABEL, a);
-        title_left += m.size as f32 + 8.0 * s;
+        let my = (y + (head_h - m.size as f32) / 2.0).round() as i32;
+        c.mask(&m.alpha, m.size as i32, text_left.round() as i32, my, INK, a);
+        title_left += m.size as f32 + HEADER_GAP * s;
     }
     let title = format!("{} Usage", pretty(provider));
-    let baseline = y + HEAD_H * s * 0.5 + TITLE_PX * s * 0.36;
-    font.left_aligned(c, &title, title_left, baseline, TITLE_PX * s, LABEL, a);
-    y += HEAD_H * s + TITLE_GAP * s;
+    let title_top = y + (head_h - line(TITLE_PX) * s) / 2.0;
+    font.left_aligned(c, &title, title_left, baseline_in(title_top, title_px), title_px, INK, a);
+    y += head_h + HEADER_TO_BLOCK * s;
 
     if r.rows.is_empty() {
-        y += ROW_GAP * s + ROW_PX * s;
-        font.left_aligned(c, "No reading yet", text_left, y, ROW_PX * s, MUTED, a);
+        body.left_aligned(c, "No reading yet", text_left, baseline_in(y, body_px), body_px, MUTED, a);
     }
     // Rows arrive in order rather than together, each easing out on its own, and each slides the
     // last few pixels up into place as it fades.
     let total_rows = r.rows.len() + r.sessions.len();
     for (n, (label, used, resets)) in r.rows.iter().enumerate() {
+        if n > 0 {
+            y += BLOCK_SPACING * s;
+        }
         let t = stagger(f.card, n, total_rows);
         let ra = a * t;
         let lift = (1.0 - t) * 6.0 * s;
-        y += ROW_GAP * s + ROW_PX * s;
-        let ry = y + lift;
+        // SplitRow: the label, and the reset time right-aligned in the quieter grey.
         let reset = resets.map(|at| reset_copy(at, now)).unwrap_or_default();
-        let rw = if reset.is_empty() { 0.0 } else { font.width(&reset, SMALL_PX * s) };
-        let room = (inner_w - rw - 8.0 * s).max(10.0);
-        let label = font.elide(label, ROW_PX * s, room);
-        font.left_aligned(c, &label, text_left, ry, ROW_PX * s, LABEL, ra);
+        let rw = if reset.is_empty() { 0.0 } else { body.width(&reset, body_px) };
+        let room = (inner_w - rw - px(20.0) * s).max(10.0);
+        let label = body.elide(label, body_px, room);
+        let bl = baseline_in(y + lift, body_px);
+        body.left_aligned(c, &label, text_left, bl, body_px, INK, ra);
         if !reset.is_empty() {
-            font.left_aligned(c, &reset, text_right - rw, ry, SMALL_PX * s, MUTED, ra);
+            body.left_aligned(c, &reset, text_right - rw, bl, body_px, MUTED, ra);
         }
-        y += BAR_GAP * s;
+        y += body_line + LABEL_TO_BAR * s;
         draw_bar(c, text_left, y + lift, inner_w, BAR_H * s, *used, ra);
-        y += BAR_H * s + USED_GAP * s + SMALL_PX * s;
+        y += BAR_H * s + BAR_TO_USED * s;
         if used.is_some() {
             let copy = format!("{} Used", pct_label(*used));
-            font.left_aligned(c, &copy, text_left, y + lift, SMALL_PX * s, MUTED, ra);
+            body.left_aligned(c, &copy, text_left, baseline_in(y + lift, body_px), body_px, INK, ra);
         }
+        y += body_line;
     }
 
     // Live sessions below the limits, under a hairline: what is running, what is waiting on you.
     if !r.sessions.is_empty() {
-        y += 12.0 * s;
-        c.round_rect(text_left + inner_w / 2.0, y, inner_w / 2.0, 0.5 * s, 0.0, RULE, None, a);
-        y += 8.0 * s;
+        y += BLOCK_SPACING * s;
+        c.round_rect(text_left + inner_w / 2.0, y + HAIRLINE * s / 2.0, inner_w / 2.0, HAIRLINE * s / 2.0, 0.0, RULE, None, a);
+        y += (HAIRLINE + BLOCK_SPACING) * s;
         for (n, (title, what)) in r.sessions.iter().enumerate() {
+            if n > 0 {
+                y += SESSION_GAP * s;
+            }
             let t = stagger(f.card, r.rows.len() + n, total_rows);
             let ra = a * t;
-            y += SMALL_PX * s;
-            let ry = y + (1.0 - t) * 6.0 * s;
-            let head = font.elide(title, SMALL_PX * s, inner_w * 0.5);
-            let pen = font.left_aligned(c, &head, text_left, ry, SMALL_PX * s, SESSION_INK, ra);
+            let bl = baseline_in(y + (1.0 - t) * 6.0 * s, body_px);
+            let head = body.elide(title, body_px, inner_w * 0.5);
+            let pen = body.left_aligned(c, &head, text_left, bl, body_px, INK, ra);
             let room = text_right - pen - 8.0 * s;
             if room > 12.0 * s {
-                let detail = font.elide(what, SMALL_PX * s, room);
-                let dw = font.width(&detail, SMALL_PX * s);
-                font.left_aligned(c, &detail, text_right - dw, ry, SMALL_PX * s, MUTED, ra);
+                let detail = body.elide(what, body_px, room);
+                let dw = body.width(&detail, body_px);
+                body.left_aligned(c, &detail, text_right - dw, bl, body_px, MUTED, ra);
             }
-            y += 4.0 * s;
+            y += body_line;
         }
     }
 }
@@ -1039,6 +1069,7 @@ fn main() {
         // Without a usable UI font there is nothing to print a percentage with; the pill would be
         // rings and no numbers, so this is a hard stop rather than a silent half-drawn panel.
         let Some(mut font) = Text::system() else { return };
+        let Some(mut body) = Text::regular() else { return };
 
         // Taking the hook port is what makes "waiting on you" possible: those events are the only
         // thing that can tell a finished turn from one waiting for an answer. If the bind fails the
@@ -1411,6 +1442,7 @@ fn main() {
                     },
                     &mut marks,
                     &mut font,
+                    &mut body,
                 );
                 drawn_scale = next_scale;
                 drawn_card = next_card;
@@ -2100,7 +2132,7 @@ mod tests {
     fn paint(lay: &Layout, readings: &[(&str, Reading)], card: f32, t: f32) -> Canvas {
         let mut c = Canvas::new(lay.w, lay.h);
         let f = Frame { lay, readings, cs: 1.0, card, t, panel: Some(0) };
-        render(&mut c, &f, &mut Marks::default(), &mut Text::system().unwrap());
+        render(&mut c, &f, &mut Marks::default(), &mut Text::system().unwrap(), &mut Text::regular().unwrap());
         c
     }
 
@@ -2120,7 +2152,9 @@ mod tests {
     #[ignore]
     fn dump_the_pill() {
         use resvg::tiny_skia;
-        let lay = Layout::new(1.2, 3, 0.0);
+        // DUMP_SCALE matches a reference image: the upstream mockup is 1.66 px per point.
+        let scale: f32 = std::env::var("DUMP_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.2);
+        let lay = Layout::new(scale, 3, 0.0);
         // The upstream mockup's numbers, so the dump can be held up against it.
         let mut claude = reading(Some(0.73), Work::Idle);
         let now = now_ms();
@@ -2137,13 +2171,14 @@ mod tests {
         let which: usize = std::env::var("DUMP_PANEL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let open = std::env::var("DUMP_OPEN").is_ok();
         let needed = panels_height(&lay, &readings);
-        let lay = Layout::new(1.2, 2, needed);
+        let lay = Layout::new(scale, readings.len(), needed);
         let mut c = Canvas::new(lay.w, lay.h);
         render(
             &mut c,
             &Frame { lay: &lay, readings: &readings, cs: 1.0, card: if open { 1.0 } else { 0.0 }, t: 0.0, panel: Some(which) },
             &mut Marks::default(),
             &mut Text::system().unwrap(),
+            &mut Text::regular().unwrap(),
         );
 
         let mut pm = tiny_skia::Pixmap::new(lay.w as u32, lay.h as u32).unwrap();
@@ -2213,14 +2248,15 @@ largura solida (alpha>200) por linha, do topo e da base:");
         let mut c = Canvas::new(lay.w, lay.h);
         let mut marks = Marks::default();
         let mut font = Text::system().unwrap();
+        let mut body = Text::regular().unwrap();
 
         for (name, card) in [("pill so", 0.0), ("painel aberto", 1.0), ("meio da troca", 0.5)] {
             let f = Frame { lay: &lay, readings: &readings, cs: 1.0, card, t: 0.3, panel: Some(0) };
-            render(&mut c, &f, &mut marks, &mut font); // aquece os caches
+            render(&mut c, &f, &mut marks, &mut font, &mut body); // aquece os caches
             let t0 = std::time::Instant::now();
             const N: u32 = 30;
             for _ in 0..N {
-                render(&mut c, &f, &mut marks, &mut font);
+                render(&mut c, &f, &mut marks, &mut font, &mut body);
             }
             let per = t0.elapsed().as_secs_f64() * 1000.0 / N as f64;
             println!("{name:>16}: {per:.2} ms por frame  ({}x{})", lay.w, lay.h);

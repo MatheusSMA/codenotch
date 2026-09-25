@@ -109,6 +109,44 @@ impl Canvas {
         }
     }
 
+    /// An arc with round ends, as SwiftUI's `lineCap: .round` draws the usage arc. One pass takes
+    /// the larger of the band's and the two end discs' coverage, so a dimmed arc does not come out
+    /// darker where a cap overlaps it.
+    pub fn arc_capped(&mut self, cx: f32, cy: f32, r: f32, width: f32, rgb: [f32; 3], alpha: f32, from: f32, to: f32) {
+        use std::f32::consts::PI;
+        if to <= from {
+            return;
+        }
+        if to - from >= 1.0 {
+            return self.arc(cx, cy, r, width, rgb, alpha, from, to);
+        }
+        let reach = r + width / 2.0 + 2.0;
+        let x0 = (cx - reach).floor().max(0.0) as i32;
+        let x1 = (cx + reach).ceil().min(self.w as f32) as i32;
+        let y0 = (cy - reach).floor().max(0.0) as i32;
+        let y1 = (cy + reach).ceil().min(self.h as f32) as i32;
+        let (a0, a1) = (from * 2.0 * PI, to * 2.0 * PI);
+        // Clockwise from 12 o'clock, as `arc` measures it.
+        let end = |a: f32| (cx + r * a.sin(), cy - r * a.cos());
+        let (e0, e1) = (end(a0), end(a1));
+        let half = width / 2.0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let (px, py) = (fx - cx, fy - cy);
+                let band = 1.0 - smoothstep(half - 0.5, half + 0.5, (px.hypot(py) - r).abs());
+                let ang = (px.atan2(-py)).rem_euclid(2.0 * PI);
+                let inside = { let a = if ang < a0 { ang + 2.0 * PI } else { ang }; a >= a0 && a <= a1 };
+                let body = if inside { band } else { 0.0 };
+                let disc = |e: (f32, f32)| 1.0 - smoothstep(half - 0.5, half + 0.5, (fx - e.0).hypot(fy - e.1));
+                let cover = body.max(disc(e0)).max(disc(e1));
+                if cover > 0.0 {
+                    self.put(x, y, rgb, cover * alpha);
+                }
+            }
+        }
+    }
+
     /// A concave corner filling the gap between a panel edge and the screen edge: an r-by-r square
     /// hugging the right edge with a circle of radius `r` punched out of it, centred on the corner
     /// furthest from the screen. What survives is the inward-curving arc, and the panel stops
