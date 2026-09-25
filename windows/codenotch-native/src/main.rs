@@ -65,25 +65,27 @@ const PILL_W: f32 = px(186.0);
 const RADIUS: f32 = px(78.8);
 /// `curlRadius`: the concave flares above and below the body.
 const FILLET: f32 = px(103.0);
-/// `padTop`, body top to the first ring, and `padBottom`, last label to body bottom.
-const PAD_Y: f32 = px(69.5);
-const PAD_BOTTOM: f32 = px(50.1);
+/// `padTop`, body top to the first ring, and `padBottom`, last label to body bottom. Longer than
+/// the frame's 69.5 / 50.1 (and `cellSpacing` than its 83.5): the user wanted the bar stretched.
+const PAD_Y: f32 = px(95.0);
+const PAD_BOTTOM: f32 = px(75.0);
 /// `cellSpacing`: one label's bottom to the next ring's top.
-const GAP: f32 = px(83.5);
-/// `ringDiameter`, the track's outer edge.
+const GAP: f32 = px(125.0);
+/// `ringDiameter`, the track's outer edge. The strokes are thinner than the frame's 15.5 / 8 and
+/// the glyph bigger than its 46, by the user's choice.
 const RING_BOX: f32 = px(117.0);
-const TRACK_STROKE: f32 = px(15.5);
+const TRACK_STROKE: f32 = px(9.0);
 /// The usage arc rides the track's centre line, thinner than it, with round ends.
-const PROGRESS_STROKE: f32 = px(8.0);
+const PROGRESS_STROKE: f32 = px(6.0);
 /// The working indicator, between the glyph and the track's inner edge.
-const ACTIVITY_D: f32 = px(72.0);
+const ACTIVITY_D: f32 = px(84.0);
 const ACTIVITY_STROKE: f32 = px(5.5);
 /// `ringLabelGap`: ring bottom to the top of the percent's line box.
 const TEXT_GAP: f32 = px(26.9);
 /// `Typography.percent`, semibold.
 const PCT_PX: f32 = cap(27.0);
 /// `glyphSize`, the provider mark inside the ring and in the card's header.
-const MARK: f32 = px(46.0);
+const MARK: f32 = px(60.0);
 
 // The hover card, to the left of the pill, one provider at a time.
 const CARD_W: f32 = px(600.0);
