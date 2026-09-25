@@ -70,7 +70,7 @@ const FILLET: f32 = px(103.0);
 const PAD_Y: f32 = px(95.0);
 const PAD_BOTTOM: f32 = px(75.0);
 /// `cellSpacing`: one label's bottom to the next ring's top.
-const GAP: f32 = px(125.0);
+const GAP: f32 = px(100.0);
 /// `ringDiameter`, the track's outer edge. The strokes are thinner than the frame's 15.5 / 8 and
 /// the glyph bigger than its 46, by the user's choice.
 const RING_BOX: f32 = px(117.0);
