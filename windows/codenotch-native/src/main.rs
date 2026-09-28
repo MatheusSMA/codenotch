@@ -128,6 +128,10 @@ const REVEAL_REACH: f32 = PEEK;
 /// further — without a grace period that slide is indistinguishable from a pointer that was parked
 /// there all along, and the pill would only ever open for a push that landed on the rows exactly.
 const PUSH_GRACE: Duration = Duration::from_millis(350);
+/// And then it has to stay against the edge, level with the pill, this long. A push alone still
+/// fired on every trip to the edge for something else (a maximised window's scrollbar lives there),
+/// so the reveal waits for a pointer that stops, and a button going down calls it off.
+const REVEAL_HOLD: Duration = Duration::from_millis(250);
 /// How much sideways travel counts as a push rather than the wobble of a hand that has come to
 /// rest. A pointer settling near the edge still creeps a pixel at a time, and one creeping pixel
 /// used to arm the reveal.
@@ -1170,6 +1174,8 @@ fn main() {
         // Where the pointer was last frame, and when it last pushed outwards inside the edge
         // strip: the reveal triggers on that push, not on the pointer merely being there.
         let mut pushed_at: Option<Instant> = None;
+        // Since when an armed pointer has rested against the edge on the pill's rows.
+        let mut held_since: Option<Instant> = None;
         let mut prev_x = i32::MAX;
         let mut click_through = true;
         let mut dirty = true;
@@ -1286,7 +1292,14 @@ fn main() {
             } else if cur.x.saturating_sub(prev_x) >= PUSH_STEP {
                 pushed_at = Some(Instant::now());
             }
-            let pushed_out = in_rows && pushed_at.is_some_and(|t| t.elapsed() < PUSH_GRACE);
+            let armed = pushed_at.is_some_and(|t| t.elapsed() < PUSH_GRACE);
+            let pressing = GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0;
+            if !(at_edge && in_rows) || pressing {
+                held_since = None;
+            } else if held_since.is_none() && armed {
+                held_since = Some(Instant::now());
+            }
+            let pushed_out = held_since.is_some_and(|t| t.elapsed() >= REVEAL_HOLD);
             prev_x = cur.x;
 
             // Leaving waits; arriving does not. A pointer on its way past should not open it, but

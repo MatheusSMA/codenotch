@@ -65,6 +65,8 @@ const HIDDEN_OPACITY = 90;
 /// The reveal asks for a push towards the edge, not mere presence (see main.rs for the history).
 const PUSH_STEP = 12;
 const PUSH_GRACE_MS = 350;
+/// ...and it has to rest against the edge on the pill's rows this long; a button going down cancels.
+const REVEAL_HOLD_MS = 250;
 const HOVER_PAD = 12;
 const HOVER_HYSTERESIS = 80;
 const LEAVE_DWELL_MS = 300;
@@ -180,6 +182,7 @@ export default class CodenotchExtension extends Extension {
         this._shown = false;
         this._card = null;
         this._pushedAt = 0;
+        this._heldSince = 0;
         this._prevX = Number.MAX_SAFE_INTEGER;
         this._leftAt = 0;
         this._sinceTick = 0;
@@ -282,7 +285,7 @@ export default class CodenotchExtension extends Extension {
         if (!this._pill)
             return;
         const g = this._geometry();
-        const [x, y] = global.get_pointer();
+        const [x, y, mods] = global.get_pointer();
         const now = GLib.get_monotonic_time() / 1000;
         const right = g.mon.x + g.mon.width;
         const top = g.y + g.pillTop;
@@ -304,7 +307,13 @@ export default class CodenotchExtension extends Extension {
             x >= this._cardRect.x - HOVER_PAD && x <= right &&
             y >= this._cardRect.y - HOVER_PAD && y <= this._cardRect.y + this._cardRect.h + HOVER_PAD;
         const inside = overPill || overCard;
-        const pushedOut = inRows && this._pushedAt > 0 && now - this._pushedAt < PUSH_GRACE_MS;
+        const armed = this._pushedAt > 0 && now - this._pushedAt < PUSH_GRACE_MS;
+        const pressing = (mods & (Clutter.ModifierType.BUTTON1_MASK | Clutter.ModifierType.BUTTON3_MASK)) !== 0;
+        if (!(atEdge && inRows) || pressing)
+            this._heldSince = 0;
+        else if (!this._heldSince && armed)
+            this._heldSince = now;
+        const pushedOut = this._heldSince > 0 && now - this._heldSince >= REVEAL_HOLD_MS;
 
         let want;
         if (this._shown && inside) {
